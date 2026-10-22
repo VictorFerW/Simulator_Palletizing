@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(cargo --version)",
+      "PowerShell(rustc --version)",
+      "PowerShell(rustup show active-toolchain)"
+    ]
+  }
+}

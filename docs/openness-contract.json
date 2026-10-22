@@ -1,0 +1,34 @@
+{
+  "schema_version": "2.0",
+  "request": {
+    "schema_version": "2.0",
+    "operation": "export_project_structure",
+    "project_path": "C:/projetos/celula/celula.ap18"
+  },
+  "response": {
+    "project": {
+      "name": "celula",
+      "plcs": [
+        {
+          "name": "PLC_1",
+          "tag_tables": [
+            {
+              "name": "TagTable_Paletizacao",
+              "tags": [
+                { "name": "Aciona_Rolete", "data_type": "Bool", "address": "%Q0.0", "comment": "Motor dos roletes" }
+              ]
+            }
+          ],
+          "data_blocks": [
+            { "name": "DB_Celula", "number": 10, "optimized": false, "xml": "<Document>... SimaticML exportado por PlcBlock.Export ...</Document>" },
+            { "name": "DB_Inconsistente", "number": 11, "error": "motivo da falha de exportação" }
+          ],
+          "types": [
+            { "name": "UDT_Motor", "xml": "<Document>... SimaticML exportado por PlcType.Export ...</Document>" }
+          ]
+        }
+      ]
+    },
+    "diagnostics": []
+  }
+}

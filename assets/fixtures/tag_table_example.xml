@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TagTable name="TagTable_Paletizacao">
+  <Tag><Name>Aciona_Rolete_01</Name><DataType>Bool</DataType><LogicalAddress>%Q0.0</LogicalAddress><Comment>Aciona o motor da esteira 1</Comment></Tag>
+  <Tag><Name>Sensor_Pallet_Presente</Name><DataType>Bool</DataType><LogicalAddress>%I0.2</LogicalAddress></Tag>
+  <Tag><Name>Velocidade_Esteira</Name><DataType>Real</DataType><LogicalAddress>%MD20</LogicalAddress></Tag>
+</TagTable>
