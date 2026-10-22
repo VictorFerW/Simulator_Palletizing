@@ -9,6 +9,7 @@ use crate::layout::LayoutRequests;
 use crate::model::{Equipment, EquipmentKind, Io, NeedsRebuild, Selection, SignalDir, SignalType, SimControl, TagBindings};
 use crate::robot::{RobotState, yaw_of};
 use crate::mesa_logic::MesaLogic;
+use crate::paper::{PaperPlacerLogic, PaperPlacerState};
 use crate::shuttle::{ShuttleLogic, ShuttleState};
 use crate::sim::{Load, PalletizerState};
 use crate::tia_importer::{
@@ -96,10 +97,10 @@ pub fn ui_system(
     mut layout: ResMut<LayoutRequests>,
     mut link: ResMut<PlcLink>,
     mut equipment: EquipmentQuery,
-    robots: Query<&RobotState>,
-    palletizers: Query<&PalletizerState>,
+    (robots, palletizers): (Query<&RobotState>, Query<&PalletizerState>),
     mesas: Query<&MesaLogic>,
     cars: Query<(&ShuttleState, &ShuttleLogic)>,
+    mut placers: Query<(&mut PaperPlacerState, &PaperPlacerLogic)>,
     mut commands: Commands,
 ) {
     let Ok(ctx) = contexts.ctx_mut() else { return };
@@ -234,6 +235,7 @@ pub fn ui_system(
                 &mut requests,
                 &mut equipment,
                 &robots,
+                &mut placers,
                 &palletizers,
                 &mesas,
                 &cars,
@@ -299,6 +301,7 @@ fn properties_tab(
     requests: &mut EditRequests,
     equipment: &mut EquipmentQuery,
     robots: &Query<&RobotState>,
+    placers: &mut Query<(&mut PaperPlacerState, &PaperPlacerLogic)>,
     palletizers: &Query<&PalletizerState>,
     mesas: &Query<&MesaLogic>,
     cars: &Query<(&ShuttleState, &ShuttleLogic)>,
@@ -465,17 +468,44 @@ fn properties_tab(
                 ui.label("Paradas (sensor de distância)");
                 ui.vertical(|ui| {
                     let mut remove = None;
+                    let paper_stop = p.paper_stop;
+                    let mut new_paper_stop = paper_stop;
+                    let mut letter = b'A';
                     for (i, stop) in p.stops.iter_mut().enumerate() {
                         ui.horizontal(|ui| {
-                            ui.label(if i == 0 { "Coleta".to_owned() } else { format!("Posição {}", (b'A' + (i as u8 - 1)) as char) });
+                            let name = if i == 0 {
+                                "Coleta".to_owned()
+                            } else if i as i32 == paper_stop {
+                                "Papelão".to_owned()
+                            } else {
+                                letter += 1;
+                                format!("Posição {}", (letter - 1) as char)
+                            };
+                            ui.label(name);
                             ui.add(egui::DragValue::new(stop).speed(0.01).range(0.0..=60.0).suffix(" m"));
-                            if i > 0 && ui.small_button("🗑").clicked() {
-                                remove = Some(i);
+                            if i > 0 {
+                                let mut is_paper = i as i32 == paper_stop;
+                                if ui
+                                    .checkbox(&mut is_paper, "CP")
+                                    .on_hover_text("Parada sob um colocador de papelão: o carro espera o papelão antes do destino")
+                                    .changed()
+                                {
+                                    new_paper_stop = if is_paper { i as i32 } else { -1 };
+                                }
+                                if ui.small_button("🗑").clicked() {
+                                    remove = Some(i);
+                                }
                             }
                         });
                     }
+                    p.paper_stop = new_paper_stop;
                     if let Some(i) = remove {
                         p.stops.remove(i);
+                        if p.paper_stop == i as i32 {
+                            p.paper_stop = -1;
+                        } else if p.paper_stop > i as i32 {
+                            p.paper_stop -= 1;
+                        }
                     }
                     if p.stops.len() < 8 && ui.small_button("+ posição").clicked() {
                         let next = p.stops.last().copied().unwrap_or(1.0) + 1.5;
@@ -488,6 +518,22 @@ fn properties_tab(
                     .on_hover_text("Recebe pallet na coleta, leva às posições A, B... em sequência e volta. Entradas lidas do CLP têm prioridade.");
                 ui.end_row();
             }
+            EquipmentKind::CardboardPlacer => {
+                row(ui, "Curso pega → entrega", &mut p.length, 0.5..=6.0, " m");
+                row(ui, "Curso do cilindro", &mut p.cp_stroke, 0.2..=1.3, " m");
+                row(ui, "Papelão: comprimento", &mut p.pallet_size[0], 0.6..=1.6, " m");
+                row(ui, "Papelão: largura", &mut p.pallet_size[2], 0.6..=1.6, " m");
+                ui.label("Aplicar papelão");
+                ui.checkbox(&mut p.apply_paper, "nos pallets que passam");
+                ui.end_row();
+                ui.label("Aplicar 2x papelão");
+                ui.checkbox(&mut p.cp_two_sheets, "dois papelões por pallet");
+                ui.end_row();
+                ui.label("Lógica interna");
+                ui.checkbox(&mut p.auto_logic, "FB do colocador sem CLP")
+                    .on_hover_text("Segura o pallet sob a entrega e aplica o papelão. Entradas lidas do CLP têm prioridade.");
+                ui.end_row();
+            }
             EquipmentKind::Sensor => {
                 row(ui, "Comprimento do feixe", &mut p.width, 0.1..=5.0, " m");
                 row(ui, "Altura do feixe", &mut p.height, 0.05..=3.0, " m");
@@ -497,7 +543,8 @@ fn properties_tab(
     let geometry_changed = before.length != eq.params.length
         || before.width != eq.params.width
         || before.height != eq.params.height
-        || (kind.is_mesa() && before.box_size != eq.params.box_size);
+        || (kind.is_mesa() && before.box_size != eq.params.box_size)
+        || (kind == EquipmentKind::CardboardPlacer && before.pallet_size != eq.params.pallet_size);
     if geometry_changed {
         commands.entity(entity).insert(NeedsRebuild);
     }
@@ -514,6 +561,25 @@ fn properties_tab(
                     robot.pose.r,
                     robot.pose.y
                 ));
+            }
+        }
+        EquipmentKind::CardboardPlacer => {
+            if let Ok((mut cp, logic)) = placers.get_mut(entity) {
+                ui.separator();
+                ui.label(format!(
+                    "Passo {} · papelões no depósito: {}{}",
+                    logic.passo,
+                    cp.sheets_left,
+                    if logic.sem_papelao { " · SEM PAPELÃO" } else { "" }
+                ));
+                ui.label(format!(
+                    "Pallet sob a entrega: {} · FimDoCiclo {}",
+                    if cp.pallet.is_some() { "sim" } else { "não" },
+                    u8::from(logic.fim_do_ciclo)
+                ));
+                if ui.button("Reabastecer depósito (100)").clicked() {
+                    cp.sheets_left = 100;
+                }
             }
         }
         EquipmentKind::ShuttleCar => {
@@ -671,7 +737,7 @@ fn tag_combo(ui: &mut egui::Ui, id: &str, chosen: &mut Option<String>, tags: &[(
 fn auto_driven(eq: &Equipment, key: &str) -> bool {
     let actuator = match eq.kind {
         EquipmentKind::PalletizingConveyor => matches!(key, "motor" | "stop"),
-        k if k.is_mesa() || k == EquipmentKind::ShuttleCar => eq.kind.signals().iter().any(|s| s.key == key && s.dir == SignalDir::In),
+        k if k.is_mesa() || k == EquipmentKind::ShuttleCar || k == EquipmentKind::CardboardPlacer => eq.kind.signals().iter().any(|s| s.key == key && s.dir == SignalDir::In),
         _ => false,
     };
     actuator && eq.params.auto_logic

@@ -23,6 +23,7 @@ Na primeira execução, o programa abre uma célula padrão que já funciona sem
 | TDP de paletização | TDP + batente de posicionamento | Segura o pallet no batente enquanto o robô paletiza. Com **lógica interna** ligada, traz o pallet vazio, segura e libera quando completa; o que vier do CLP tem prioridade |
 | Magazine de pallets | — | Coloca pallets vazios (PBR 1000 × 1200) sobre o TDP |
 | Removedor | — | Remove caixas e pallets (com a carga) que param na sua área |
+| Colocador de papelão (CP) | Selgron "MOD COLOCADOR PAPELAO C2370" + FB "CP" | Pórtico com carro entre o depósito de papelão e a entrega (1887 mm), cilindro vertical e cabeça de ventosas. Pode ficar sobre um TDP normal ou sobre uma parada do CVZ |
 | Carro de pallet vazio (CVZ) | FB "CVZ" | Carro sobre trilho com TDP que transporta perpendicular ao trilho; o pallet anda com o carro. Inversor (`LigarDrive`, `LiberarFreio`, `Velocidade` em mm/s) e sensor de distância (`PosicaoAtual` em mm) |
 
 As duas mesas terminam na **mesa área de coleta** (FB "Mesa Antecipada Coleta"): motor e batente próprios, sensores Coleta1/Coleta2. Ela recebe o par de fardos, recolhe o batente e dá `Autoriza_Pick`; o robô pega o par inteiro e responde `Robo_Fardos_Coletados`.
@@ -58,6 +59,15 @@ O visual usa o **modelo do fabricante** (STEP SolidWorks M-410iC185, com pedesta
 
 O robô usa o cabeçote Selgron "MOD CAB 4 FARDOS" (0323P01-010000): quadro de 1234 × 500 mm com acoplamento 435 mm acima da base (o TCP fica na base do quadro, onde o topo dos fardos encosta), divisória central de 229 mm e duas pinças laterais de 295 mm acionadas pelos cilindros CIL 40-420. As pinças fecham sobre o grupo coletado e abrem ao depositar.
 
+## Colocador de papelão (CP)
+
+O carro do CP corre entre a posição de **pega**, sobre o depósito com a pilha de papelões, e a de **entrega** (círculo amarelo quando o CP está selecionado), onde o centro do pallet deve parar. A cabeça de ventosas é flutuante: o `SensorPapelaoInferior` fica ligado com a cabeça solta e sem papelão, e o `SensorPapelaoSuperior` liga quando ela é pressionada contra a pilha ou o pallet. A folha aplicada fica sobre o pallet, anda com ele, e o robô empilha em cima dela.
+
+- **Sobre um TDP normal:** um pallet sem papelão que chega sob a entrega é segurado ali (como o TDP parando no sensor) até o fim do ciclo, e a fila atrás dele espera.
+- **Como parada do CVZ:** marque a caixa **CP** numa das paradas do carro. Depois de receber o pallet na coleta, o carro vai primeiro até essa parada, espera o papelão e só então segue para o destino.
+
+Sem CLP, a **lógica interna** porta os passos automáticos do FB CP (0–2, 100–117, 200/201, 400): desce na pilha, liga o vácuo ao perder os dois sensores, para no sensor superior, estabiliza, sobe, confere o sensor inferior (sem papelão → passo 400), vai à entrega, desce até o sensor superior, desliga o vácuo, sobe e volta. A opção **Aplicar 2x papelão** repete a aplicação. O botão **Reabastecer depósito** repõe a pilha. A escolha "aplicar ou não" por ID de linha do FB vem do CLP; internamente vale a opção **Aplicar papelão**.
+
 ## Carro de pallet vazio (CVZ)
 
 O trilho fica ao longo do X local do equipamento e o TDP do carro transporta ao longo do Z local: recebe de um lado do trilho e entrega do outro. O sensor de distância fica no início do trilho e mede o centro do carro em mm. As paradas (coleta, posição A, B, …) são configuradas em Propriedades.
@@ -75,6 +85,7 @@ Sem CLP, a **lógica interna** porta o posicionamento do FB CVZ (passo 201): vel
 | TDP de paletização | Motor ligado, Batente de posicionamento | Pallet em posição, Pallet completo, Caixas no pallet (Int) |
 | FANUC M-410iC/185 | Liberar ciclo, Autoriza_Pick | Em ciclo, Robo_Fardos_Coletados, Pallet completo, Caixas no pallet (Int) |
 | Emissor / Magazine / Removedor | Emitir / Liberar pallet / Remover | — |
+| Colocador de papelão (CP) | MotorPosicaoColeta, MotorPosicaoEntrega, CilindroAvancar, CilindroRecuar, Vacuo | LimitePega, LimiteEntrega, SensorCilindroAv, SensorCilindroRc, SensorPapelaoInferior, SensorPapelaoSuperior, SensorTDP |
 | Carro de pallet vazio (CVZ) | LigarDrive, LiberarFreio, Velocidade (Int mm/s), Motor_TDP, Reverso_TDP | PosicaoAtual (Int mm), DriverFDBVelocidade (Int mm/s), DriverEmFalha, SensorExtremoAtivoTDP, Sensor_Pallet_Carro |
 | Sensor fotoelétrico | — | Objeto detectado |
 

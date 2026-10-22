@@ -5,6 +5,7 @@ mod io;
 mod layout;
 mod mesa_logic;
 mod model;
+mod paper;
 mod robot;
 mod s7;
 mod shuttle;
@@ -65,24 +66,36 @@ fn main() {
                     .chain(),
                 (editor::camera_controls, editor::pick_and_drag, editor::keyboard_edit),
                 (
-                    io::plc_events,
-                    io::apply_inputs,
-                    sim::reset_simulation,
-                    sim::palletizers,
-                    mesa_logic::run_mesas,
-                    shuttle::shuttle_logic,
-                    shuttle::shuttle_motion,
-                    sim::emitters,
-                    sim::move_loads,
-                    sim::mesa_mechanics,
-                    robot::robot_program,
-                    robot::animate_robots,
-                    sim::sensors,
-                    sim::conveyor_sensors,
-                    sim::removers,
-                    sim::animate_conveyors,
-                    shuttle::animate_shuttle,
-                    io::publish_outputs,
+                    // Controllers: PLC values or internal logic -> actuators.
+                    (
+                        io::plc_events,
+                        io::apply_inputs,
+                        sim::reset_simulation,
+                        sim::palletizers,
+                        mesa_logic::run_mesas,
+                        shuttle::shuttle_logic,
+                        paper::paper_logic,
+                    )
+                        .chain(),
+                    // Physics, sensors and outputs.
+                    (
+                        shuttle::shuttle_motion,
+                        paper::paper_hold,
+                        sim::emitters,
+                        sim::move_loads,
+                        paper::paper_mechanics,
+                        sim::mesa_mechanics,
+                        robot::robot_program,
+                        robot::animate_robots,
+                        sim::sensors,
+                        sim::conveyor_sensors,
+                        sim::removers,
+                        sim::animate_conveyors,
+                        shuttle::animate_shuttle,
+                        paper::animate_paper,
+                        io::publish_outputs,
+                    )
+                        .chain(),
                 )
                     .chain(),
                 editor::draw_gizmos,

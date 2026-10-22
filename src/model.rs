@@ -24,16 +24,19 @@ pub enum EquipmentKind {
     Sensor,
     /// Carro de pallet vazio (CVZ): car with a TDP on a rail.
     ShuttleCar,
+    /// Colocador de papelão (CP): lays cardboard sheets on pallets.
+    CardboardPlacer,
 }
 
 impl EquipmentKind {
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::BeltConveyor,
         Self::Table2Stage,
         Self::Table3Stage,
         Self::PalletConveyor,
         Self::PalletizingConveyor,
         Self::ShuttleCar,
+        Self::CardboardPlacer,
         Self::Robot,
         Self::BoxEmitter,
         Self::PalletDispenser,
@@ -54,6 +57,7 @@ impl EquipmentKind {
             Self::BoxRemover => "Removedor (caixas/pallets)",
             Self::Sensor => "Sensor fotoelétrico",
             Self::ShuttleCar => "Carro de pallet vazio (CVZ)",
+            Self::CardboardPlacer => "Colocador de papelão (CP)",
         }
     }
 
@@ -70,6 +74,7 @@ impl EquipmentKind {
             Self::BoxRemover => "Removedor",
             Self::Sensor => "Sensor",
             Self::ShuttleCar => "CVZ",
+            Self::CardboardPlacer => "CP",
         }
     }
 
@@ -110,6 +115,7 @@ impl EquipmentKind {
             Self::BoxRemover => REMOVER_SIGNALS,
             Self::Sensor => SENSOR_SIGNALS,
             Self::ShuttleCar => SHUTTLE_SIGNALS,
+            Self::CardboardPlacer => PAPER_SIGNALS,
         }
     }
 }
@@ -196,6 +202,21 @@ const EMITTER_SIGNALS: &[SignalDef] = &[SignalDef::new("enable", "Emitir caixas"
 const DISPENSER_SIGNALS: &[SignalDef] = &[SignalDef::new("enable", "Liberar pallet", In, Bool)];
 const REMOVER_SIGNALS: &[SignalDef] = &[SignalDef::new("enable", "Remover cargas", In, Bool)];
 const SENSOR_SIGNALS: &[SignalDef] = &[SignalDef::new("detected", "Objeto detectado", Out, Bool)];
+// FB "CP" (colocador de papelão).
+const PAPER_SIGNALS: &[SignalDef] = &[
+    SignalDef::new("MotorPosicaoColeta", "Motor carro p/ coleta", In, Bool),
+    SignalDef::new("MotorPosicaoEntrega", "Motor carro p/ entrega", In, Bool),
+    SignalDef::new("CilindroAvancar", "Cilindro avançar (desce)", In, Bool),
+    SignalDef::new("CilindroRecuar", "Cilindro recuar (sobe)", In, Bool),
+    SignalDef::new("Vacuo", "Vácuo", In, Bool),
+    SignalDef::new("LimitePega", "Fim de curso pega", Out, Bool),
+    SignalDef::new("LimiteEntrega", "Fim de curso entrega", Out, Bool),
+    SignalDef::new("SensorCilindroAv", "Cilindro avançado", Out, Bool),
+    SignalDef::new("SensorCilindroRc", "Cilindro recuado", Out, Bool),
+    SignalDef::new("SensorPapelaoInferior", "Sensor papelão inferior", Out, Bool),
+    SignalDef::new("SensorPapelaoSuperior", "Sensor papelão superior", Out, Bool),
+    SignalDef::new("SensorTDP", "Pallet sob a entrega", Out, Bool),
+];
 // FB "CVZ" (carro vazio): inverter, brake, distance sensor, TDP on board.
 const SHUTTLE_SIGNALS: &[SignalDef] = &[
     SignalDef::new("LigarDrive", "Ligar inversor", In, Bool),
@@ -277,6 +298,14 @@ pub struct Params {
     pub car_speed: f32,
     /// CVZ: stop positions read by the distance sensor (m): coleta, then posição A, B...
     pub stops: Vec<f32>,
+    /// CVZ: index of the stop under a colocador de papelão (-1: none).
+    pub paper_stop: i32,
+    /// CP: vertical cylinder stroke (m).
+    pub cp_stroke: f32,
+    /// CP: lay cardboard on the pallets (else they are just released).
+    pub apply_paper: bool,
+    /// CP: two sheets per pallet (Aplicar2xPapelao).
+    pub cp_two_sheets: bool,
 }
 
 impl Default for Params {
@@ -299,6 +328,10 @@ impl Default for Params {
             car_width: 1.28,
             car_speed: 1.0,
             stops: vec![1.0, 4.0, 7.0],
+            paper_stop: -1,
+            cp_stroke: 1.05,
+            apply_paper: true,
+            cp_two_sheets: false,
         }
     }
 }
@@ -332,6 +365,8 @@ impl Params {
             EquipmentKind::BoxRemover => Self { length: 1.2, width: 1.4, height: 0.0, ..base },
             // Rail 8 m; car TDP 1560 x 1280 at 500 mm, like the fixed TDPs.
             EquipmentKind::ShuttleCar => Self { length: 8.0, width: 1.56, height: 0.5, speed: 0.25, ..base },
+            // CP C2370: 1887 mm between the deposit and the delivery position.
+            EquipmentKind::CardboardPlacer => Self { length: 1.887, width: 1.6, height: 0.0, ..base },
             // Sensor: `width` = beam length, `height` = beam height above floor.
             EquipmentKind::Sensor => Self { length: 0.1, width: 1.0, height: 1.02, ..base },
         }
@@ -358,6 +393,10 @@ impl Equipment {
     pub fn local_bounds(&self) -> (Vec3, Vec3) {
         let p = &self.params;
         match self.kind {
+            EquipmentKind::CardboardPlacer => (
+                Vec3::new(-p.length / 2.0 - 0.75, 0.0, -0.8),
+                Vec3::new(p.length / 2.0 + 1.0, 2.35, 0.8),
+            ),
             EquipmentKind::ShuttleCar => (
                 Vec3::new(-p.length / 2.0, 0.0, -p.car_length / 2.0 - 0.1),
                 Vec3::new(p.length / 2.0, p.height + 0.1, p.car_length / 2.0 + 0.3),

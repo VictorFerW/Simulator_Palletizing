@@ -226,6 +226,7 @@ pub fn build_visual(
             }
         }
         EquipmentKind::Robot => robot_visual(parent, meshes, palette),
+        EquipmentKind::CardboardPlacer => paper_visual(parent, meshes, palette, &p),
         EquipmentKind::ShuttleCar => {
             // Rail, cable chain and the distance sensor at the rail start.
             let rail = meshes.add(Cuboid::new(p.length, 0.05, 0.07));
@@ -502,6 +503,112 @@ fn table_visual(parent: &mut ChildSpawnerCommands, meshes: &mut Assets<Mesh>, pa
             Transform::from_xyz(sensor.x, h + 0.08, -(w / 2.0 + 0.06)),
         ));
     }
+}
+
+/// Colocador de papelão C2370: overhead beam on three legs, cardboard deposit
+/// under the pick end, carriage with the vertical guide and the vacuum head.
+fn paper_visual(parent: &mut ChildSpawnerCommands, meshes: &mut Assets<Mesh>, palette: &Palette, p: &crate::model::Params) {
+    use crate::paper::{DEPOSIT_FLOOR, HEAD_RETRACTED_Y, PaperCarriage, PaperHead, PaperStack};
+    let beam_y = HEAD_RETRACTED_Y + 0.95;
+    let (pick, delivery) = (-p.length / 2.0, p.length / 2.0);
+    // The last leg stands clear of the pallet (and of the CVZ) at the delivery end.
+    let (beam_start, beam_end) = (pick - 0.6, delivery + 0.95);
+    let beam_len = beam_end - beam_start + 0.2;
+    parent.spawn((
+        Mesh3d(meshes.add(Cuboid::new(beam_len, 0.16, 0.18))),
+        MeshMaterial3d(palette.frame_grey.clone()),
+        Transform::from_xyz((beam_start + beam_end) / 2.0, beam_y, -0.55),
+    ));
+    let leg = meshes.add(Cuboid::new(0.14, beam_y, 0.14));
+    for x in [beam_start, (pick + delivery) / 2.0, beam_end] {
+        parent.spawn((
+            Mesh3d(leg.clone()),
+            MeshMaterial3d(palette.frame_grey.clone()),
+            Transform::from_xyz(x, beam_y / 2.0, -0.55),
+        ));
+        parent.spawn((
+            Mesh3d(meshes.add(Cuboid::new(0.4, 0.02, 0.4))),
+            MeshMaterial3d(palette.dark.clone()),
+            Transform::from_xyz(x, 0.01, -0.55),
+        ));
+    }
+    // Motor (SA37) and cable chain on the beam.
+    parent.spawn((
+        Mesh3d(meshes.add(Cuboid::new(0.25, 0.3, 0.25))),
+        MeshMaterial3d(palette.dark.clone()),
+        Transform::from_xyz(beam_end, beam_y - 0.1, -0.35),
+    ));
+    parent.spawn((
+        Mesh3d(meshes.add(Cuboid::new(beam_len * 0.6, 0.08, 0.1))),
+        MeshMaterial3d(palette.dark.clone()),
+        Transform::from_xyz(pick + beam_len * 0.25, beam_y + 0.12, -0.55),
+    ));
+    // Cardboard deposit with its stack.
+    let (sx, sz) = (p.pallet_size[0], p.pallet_size[2]);
+    parent.spawn((
+        Mesh3d(meshes.add(Cuboid::new(sx + 0.12, 0.03, sz + 0.12))),
+        MeshMaterial3d(palette.dark.clone()),
+        Transform::from_xyz(pick, DEPOSIT_FLOOR - 0.015, 0.0),
+    ));
+    let wall_x = meshes.add(Cuboid::new(0.02, 0.9, sz + 0.12));
+    let wall_z = meshes.add(Cuboid::new(sx + 0.12, 0.9, 0.02));
+    for side in [-1.0, 1.0] {
+        parent.spawn((
+            Mesh3d(wall_x.clone()),
+            MeshMaterial3d(palette.frame_grey.clone()),
+            Transform::from_xyz(pick + side * (sx / 2.0 + 0.06), 0.45, 0.0),
+        ));
+    }
+    parent.spawn((
+        Mesh3d(wall_z.clone()),
+        MeshMaterial3d(palette.frame_grey.clone()),
+        Transform::from_xyz(pick, 0.45, -(sz / 2.0 + 0.06)),
+    ));
+    parent.spawn((
+        Mesh3d(meshes.add(Cuboid::new(sx - 0.02, 1.0, sz - 0.02))),
+        MeshMaterial3d(palette.cardboard.clone()),
+        Transform::from_xyz(pick, DEPOSIT_FLOOR + 0.25, 0.0).with_scale(Vec3::new(1.0, 0.5, 1.0)),
+        PaperStack,
+    ));
+    // Carriage running on the beam, with the head hanging from its guide.
+    parent
+        .spawn((Transform::from_xyz(pick, 0.0, 0.0), Visibility::default(), PaperCarriage))
+        .with_children(|carriage| {
+            carriage.spawn((
+                Mesh3d(meshes.add(Cuboid::new(0.45, 0.3, 0.6))),
+                MeshMaterial3d(palette.frame_blue.clone()),
+                Transform::from_xyz(0.0, beam_y, -0.3),
+            ));
+            carriage.spawn((
+                Mesh3d(meshes.add(Cuboid::new(0.12, 0.9, 0.12))),
+                MeshMaterial3d(palette.frame_grey.clone()),
+                Transform::from_xyz(0.0, beam_y + 0.45, 0.0),
+            ));
+            carriage
+                .spawn((Transform::from_xyz(0.0, HEAD_RETRACTED_Y, 0.0), Visibility::default(), PaperHead))
+                .with_children(|head| {
+                    head.spawn((
+                        Mesh3d(meshes.add(Cylinder::new(0.035, 1.3))),
+                        MeshMaterial3d(palette.steel.clone()),
+                        Transform::from_xyz(0.0, 0.75, 0.0),
+                    ));
+                    head.spawn((
+                        Mesh3d(meshes.add(Cuboid::new(0.9, 0.05, 0.7))),
+                        MeshMaterial3d(palette.frame_grey.clone()),
+                        Transform::from_xyz(0.0, 0.11, 0.0),
+                    ));
+                    let cup = meshes.add(Cylinder::new(0.045, 0.06));
+                    for x in [-0.35, 0.0, 0.35] {
+                        for z in [-0.25, 0.25] {
+                            head.spawn((
+                                Mesh3d(cup.clone()),
+                                MeshMaterial3d(palette.dark.clone()),
+                                Transform::from_xyz(x, 0.03, z),
+                            ));
+                        }
+                    }
+                });
+        });
 }
 
 /// TDP 1560 x 1280 x 120 (Selgron): C-profile sides, rollers Ø76,2 every 120 mm,

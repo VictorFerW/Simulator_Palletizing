@@ -23,6 +23,8 @@ pub struct ShuttleState {
     pub v: f32,
     /// A load rests on the car TDP.
     pub loaded: bool,
+    /// The pallet on board was released by a colocador de papelão.
+    pub cargo_papered: bool,
 }
 
 /// Child entity carrying the car meshes (moved along the rail).
@@ -39,6 +41,8 @@ pub enum ShuttleStep {
     Load,
     /// At a destination: run the TDP until the car is empty.
     Unload,
+    /// At the colocador de papelão stop: wait for the cardboard.
+    Paper,
 }
 
 #[derive(Component, Debug, Default)]
@@ -113,18 +117,37 @@ pub fn shuttle_logic(time: Res<Time>, control: Res<SimControl>, mut cars: Query<
                         drive(&mut io, "LiberarFreio", 0.0);
                         logic.inp = true;
                         logic.empty_timer = 0.0;
-                        logic.step = if logic.target == 0 { ShuttleStep::Load } else { ShuttleStep::Unload };
+                        logic.step = if logic.target == 0 {
+                            ShuttleStep::Load
+                        } else if logic.target as i32 == eq.params.paper_stop {
+                            ShuttleStep::Paper
+                        } else {
+                            ShuttleStep::Unload
+                        };
                     }
                 }
             }
             ShuttleStep::Load => {
+                let paper = eq.params.paper_stop;
                 if !io.get_bool("Sensor_Pallet_Carro") {
                     motor_tdp = true;
-                } else if stops.len() > 1 {
-                    // Destinations are served in turn (posição A, B, ...).
-                    let destination = logic.next_destination.clamp(1, stops.len() - 1);
+                } else if paper > 0 && (paper as usize) < stops.len() && !state.cargo_papered {
+                    // First the colocador de papelão.
+                    logic.target = paper as usize;
+                    logic.step = ShuttleStep::Travel;
+                } else if let Some(destination) = next_destination(&mut logic, stops.len(), paper) {
                     logic.target = destination;
-                    logic.next_destination = if destination + 1 >= stops.len() { 1 } else { destination + 1 };
+                    logic.step = ShuttleStep::Travel;
+                }
+            }
+            ShuttleStep::Paper => {
+                if state.cargo_papered
+                    && let Some(destination) = next_destination(&mut logic, stops.len(), eq.params.paper_stop)
+                {
+                    if std::env::var("PDT_TRACE").is_ok() {
+                        eprintln!("[{:.2}] {}: papelão ok, indo para a parada {destination}", time.elapsed_secs(), eq.name);
+                    }
+                    logic.target = destination;
                     logic.step = ShuttleStep::Travel;
                 }
             }
@@ -146,6 +169,18 @@ pub fn shuttle_logic(time: Res<Time>, control: Res<SimControl>, mut cars: Query<
     }
 }
 
+/// Destinations are served in turn (posição A, B, ...), skipping the coleta and the
+/// colocador de papelão stop.
+fn next_destination(logic: &mut ShuttleLogic, stops: usize, paper_stop: i32) -> Option<usize> {
+    let candidates: Vec<usize> = (1..stops).filter(|i| *i as i32 != paper_stop).collect();
+    if candidates.is_empty() {
+        return None;
+    }
+    let pick = candidates.iter().copied().find(|i| *i >= logic.next_destination).unwrap_or(candidates[0]);
+    logic.next_destination = pick + 1;
+    Some(pick)
+}
+
 /// Inverter + brake dynamics, carries the loads on board, publishes the
 /// distance sensor and the drive feedback.
 #[allow(clippy::type_complexity)]
@@ -153,7 +188,7 @@ pub fn shuttle_motion(
     time: Res<Time>,
     control: Res<SimControl>,
     mut cars: Query<(&Equipment, &Transform, &mut ShuttleState, &mut Io), Without<Load>>,
-    mut loads: Query<(&Load, &mut Transform), Without<Equipment>>,
+    mut loads: Query<(&Load, &mut Transform, Option<&crate::sim::PalletLoad>), Without<Equipment>>,
 ) {
     let dt = if control.running { time.delta_secs() * control.time_scale } else { 0.0 };
     for (eq, tf, mut state, mut io) in &mut cars {
@@ -185,7 +220,8 @@ pub fn shuttle_motion(
         let inverse = surface.transform.compute_affine().inverse();
         let shift = tf.rotation * Vec3::X * dx;
         let mut loaded = false;
-        for (load, mut ltf) in &mut loads {
+        let mut papered = false;
+        for (load, mut ltf, content) in &mut loads {
             if load.state != LoadState::Free {
                 continue;
             }
@@ -195,10 +231,12 @@ pub fn shuttle_motion(
                 && (local.y - load.size.y / 2.0 - surface.top).abs() < 0.05;
             if on_car {
                 loaded = true;
+                papered |= content.is_some_and(|c| c.papered);
                 ltf.translation += shift;
             }
         }
         state.loaded = loaded;
+        state.cargo_papered = papered;
 
         // Distance sensor at the rail start; 0 would mean signal lost.
         io.set("PosicaoAtual", (state.x * 1000.0).round() as f64);

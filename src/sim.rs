@@ -36,6 +36,8 @@ pub struct Load {
     vy: f32,
     /// Lifted by a mesa comb (garra): the rollers do not move it meanwhile.
     carried: bool,
+    /// Held in place by a colocador de papelão while it works.
+    pub hold: bool,
 }
 
 /// What is stacked on a pallet load.
@@ -47,6 +49,10 @@ pub struct PalletLoad {
     pub units: u32,
     /// Footprint of one placement, fixed by the first one.
     pub unit_size: Option<Vec3>,
+    /// Cardboard sheets laid on the pallet floor.
+    pub sheets: u32,
+    /// Released by the colocador de papelão (FimDoCiclo).
+    pub papered: bool,
 }
 
 /// State of a TDP de paletização: the pallet held at its stop.
@@ -255,6 +261,10 @@ pub fn move_loads(
         let floor = support.map_or(0.0, |s| list[s].top_world_y());
         let bottom = pos.y - size.y / 2.0;
         let Ok((_, mut load, mut tf)) = loads.get_mut(entity) else { continue };
+        if load.hold {
+            // Stopped under the colocador de papelão; still blocks the queue behind.
+            continue;
+        }
         if bottom > floor + 0.001 {
             load.vy -= GRAVITY * dt;
             pos.y = (pos.y + load.vy * dt).max(floor + size.y / 2.0);
@@ -526,6 +536,7 @@ pub fn spawn_load(
                 state: LoadState::Free,
                 vy: 0.0,
                 carried: false,
+                hold: false,
             },
         ))
         .id();

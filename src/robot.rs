@@ -431,6 +431,10 @@ pub fn robot_program(
                         state.status = "Pallet completo".into();
                         break 'logic;
                     }
+                    if loads.get(tdp.pallet.expect("checked")).is_ok_and(|(_, l, _)| l.hold) {
+                        state.status = "Aguardando colocador de papelão".into();
+                        break 'logic;
+                    }
                     // Autoriza_Pick: from the PLC, else from the mesa's internal logic.
                     let mesa_logic = mesas.get(pick_entity).ok().filter(|_| pick_eq.params.auto_logic);
                     let authorized = if io.from_plc.contains("Autoriza_Pick") {
@@ -501,6 +505,9 @@ pub fn robot_program(
                         state.status = "Pallet completo".into();
                         break 'logic;
                     };
+                    // Stack on top of the cardboard sheets.
+                    let sheets = pallet_loads.get(pallet_entity).map_or(0, |p| p.sheets);
+                    let slot_local = slot_local + Vec3::Y * sheets as f32 * crate::paper::SHEET_THICKNESS;
                     let place_top = pallet_tf.transform_point(slot_local + Vec3::Y * unit.y / 2.0);
                     let local_pick = world_to_local.transform_point3(state.pick_top);
                     let local_place = world_to_local.transform_point3(place_top);

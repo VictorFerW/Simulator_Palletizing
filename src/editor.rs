@@ -78,6 +78,9 @@ pub fn spawn_equipment(
         EquipmentKind::ShuttleCar => {
             root.insert((ConveyorState::default(), ShuttleState::default(), ShuttleLogic::default()));
         }
+        EquipmentKind::CardboardPlacer => {
+            root.insert((crate::paper::PaperPlacerState::default(), crate::paper::PaperPlacerLogic::default()));
+        }
         k if k.is_mesa() => {
             let logic = MesaLogic::for_kind(k).expect("mesa kind");
             root.insert((ConveyorState::default(), MesaMech::default(), logic));
@@ -607,6 +610,11 @@ pub fn draw_gizmos(
                     Color::srgb(0.1, 1.0, 0.3)
                 };
                 gizmos.line(a, b, color);
+            }
+            EquipmentKind::CardboardPlacer if selected => {
+                // Delivery point: the pallet center must stop here.
+                let at = crate::paper::delivery_point(eq, tf) + Vec3::Y * 0.02;
+                gizmos.circle(Isometry3d::new(at, Quat::from_rotation_x(FRAC_PI_2)), 0.15, Color::srgb(1.0, 1.0, 0.2));
             }
             EquipmentKind::Robot if selected => {
                 gizmos.circle(
