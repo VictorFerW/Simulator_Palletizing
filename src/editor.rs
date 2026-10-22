@@ -11,7 +11,7 @@ use bevy::{
 };
 
 use crate::model::{Equipment, EquipmentKind, Io, NeedsRebuild, Params, Selection, TagBindings, unique_name};
-use crate::robot::{REACH, RobotState};
+use crate::robot::{REACH, RobotState, spec};
 use crate::mesa_logic::MesaLogic;
 use crate::sim::{self, ConveyorState, EmitterState, Load, MesaMech, PalletizerState};
 use crate::conveyor;
@@ -80,6 +80,12 @@ pub fn spawn_equipment(
         }
         EquipmentKind::CardboardPlacer => {
             root.insert((crate::paper::PaperPlacerState::default(), crate::paper::PaperPlacerLogic::default()));
+        }
+        EquipmentKind::PalletElevator => {
+            root.insert((
+                crate::elevator::ElevatorState::new(&equipment.params),
+                crate::elevator::ElevatorLogic::default(),
+            ));
         }
         k if k.is_mesa() => {
             let logic = MesaLogic::for_kind(k).expect("mesa kind");
@@ -512,6 +518,7 @@ pub fn draw_gizmos(
     settings: Res<EditorSettings>,
     selection: Res<Selection>,
     equipment: Query<(Entity, &Equipment, &Transform, &Io, Option<&ShuttleState>)>,
+    robots: Query<&RobotState>,
 ) {
     if settings.show_grid {
         gizmos
@@ -617,11 +624,18 @@ pub fn draw_gizmos(
                 gizmos.circle(Isometry3d::new(at, Quat::from_rotation_x(FRAC_PI_2)), 0.15, Color::srgb(1.0, 1.0, 0.2));
             }
             EquipmentKind::Robot if selected => {
-                gizmos.circle(
-                    Isometry3d::new(tf.translation + Vec3::Y * 0.01, Quat::from_rotation_x(FRAC_PI_2)),
-                    REACH,
-                    Color::srgba(1.0, 0.8, 0.0, 0.6),
-                );
+                // Data sheet envelope: reach (R3143), inner radius at the floor (1100) and
+                // rear interference (R725), plus the operating space of the flange center
+                // in the current arm plane (top 2397, bottom -561).
+                let floor = Isometry3d::new(tf.translation + Vec3::Y * 0.01, Quat::from_rotation_x(FRAC_PI_2));
+                gizmos.circle(floor, REACH, Color::srgba(1.0, 0.8, 0.0, 0.6));
+                gizmos.circle(floor, spec::MIN_RADIUS, Color::srgba(1.0, 0.5, 0.0, 0.5));
+                gizmos.circle(floor, spec::REAR_RADIUS, Color::srgba(1.0, 0.2, 0.1, 0.6));
+                let theta = robots.get(entity).map_or(0.0, |r| r.pose.theta);
+                let points = crate::robot::envelope_outline(24)
+                    .into_iter()
+                    .map(|p| tf.transform_point(Vec3::new(p.x * theta.cos(), p.y, -p.x * theta.sin())));
+                gizmos.linestrip(points, Color::srgba(0.3, 0.9, 1.0, 0.8));
             }
             _ => {}
         }

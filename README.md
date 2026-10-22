@@ -23,6 +23,7 @@ Na primeira execução, o programa abre uma célula padrão que já funciona sem
 | TDP de paletização | TDP + batente de posicionamento | Segura o pallet no batente enquanto o robô paletiza. Com **lógica interna** ligada, traz o pallet vazio, segura e libera quando completa; o que vier do CLP tem prioridade |
 | Magazine de pallets | — | Coloca pallets vazios (PBR 1000 × 1200) sobre o TDP |
 | Removedor | — | Remove caixas e pallets (com a carga) que param na sua área |
+| Elevador de pallets (alimentador) | Selgron "MOD ALIMENTADOR DE PALETE" + FB do elevador | Quadro de quatro colunas sobre um TDP, com garras laterais num carro vertical e a pilha de pallets vazios. Solta um pallet por vez no TDP |
 | Colocador de papelão (CP) | Selgron "MOD COLOCADOR PAPELAO C2370" + FB "CP" | Pórtico com carro entre o depósito de papelão e a entrega (1887 mm), cilindro vertical e cabeça de ventosas. Pode ficar sobre um TDP normal ou sobre uma parada do CVZ |
 | Carro de pallet vazio (CVZ) | FB "CVZ" | Carro sobre trilho com TDP que transporta perpendicular ao trilho; o pallet anda com o carro. Inversor (`LigarDrive`, `LiberarFreio`, `Velocidade` em mm/s) e sensor de distância (`PosicaoAtual` em mm) |
 
@@ -57,6 +58,35 @@ O visual usa o **modelo do fabricante** (STEP SolidWorks M-410iC185, com pedesta
 
 ### Cabeçote
 
+### Dados reais (folha de dados FANUC)
+
+| Item | Valor |
+| --- | --- |
+| Carga máxima no punho | 185 kg |
+| Alcance (centro do flange) | 3143 mm |
+| Repetibilidade | ±0,05 mm |
+| Massa | 1600 kg (1330 kg sem pedestal) |
+| Faixas de movimento | J1 360° (±180°), J2 144°, J3 136°, J4 720° (±360°) |
+| Velocidades máximas | J1 140°/s, J2 140°/s, J3 140°/s, J4 305°/s |
+| Momento admissível no J4 | 88 N·m |
+| Espaço de trabalho do flange | de −561 mm a 2397 mm de altura (base pedestal, J2 a 1110 mm), raio interno de 1100 mm no piso, interferência traseira R725 |
+
+A divisão das faixas de J2 e J3, que a folha de dados dá só como total, foi escolhida para reproduzir o desenho do envelope: J2 (braço inferior a partir da vertical, para a frente positivo) de −44° a +100° e J3 (braço superior a partir da horizontal) de −126° a +10°. Com esses limites, o topo, o fundo e o raio interno do envelope batem com o desenho (há um teste para isso). Uma posição fora dos limites é tratada como fora do alcance.
+
+Os movimentos seguem as rotinas TP. As transferências são **J** (interpolação por eixos): a duração vem do eixo mais lento na sua velocidade máxima. As subidas e descidas são **L** (reta) nas velocidades das rotinas: PICK desce a 3000 mm/s e sobe a 1800 mm/s; PLACE desce a 2000 mm/s e sobe a 4000 mm/s, limitadas pelas velocidades dos eixos. Todos usam perfil trapezoidal com rampa de 0,35 s e são multiplicados pelo override (`OVERRIDE=R[104]`). O J1 não passa de ±180°: se a mesa e o pallet estiverem dos dois lados dessa emenda, o robô dá a volta longa, como o real. Por isso, gire a base do robô para que o 0° do J1 aponte para a área de trabalho (na célula padrão, −135°). O painel do robô mostra a posição e a velocidade de cada eixo contra os limites. Com o robô selecionado, o editor desenha o alcance, o raio interno, a interferência traseira e o contorno do espaço de trabalho no plano do braço.
+
+A geometria do braço vem do modelo STEP do fabricante. Ele divide os mesmos 1945 mm um pouco diferente da folha de dados: 394/1306/244 mm contra 390/1300/255 mm.
+
+### Várias mesas, vários TDPs e vários robôs
+
+Em **Coletar de** e **Paletizar em** marque uma ou mais mesas/esteiras e um ou mais TDPs de paletização; sem nenhum marcado, o robô usa todos ao alcance. As mesas são atendidas em rodízio, e o TDP com o pallet mais adiantado vem primeiro, então os pallets são completados um de cada vez (quando um sai, o robô passa para o outro).
+
+Vários robôs podem dividir mesas e TDPs. Cada robô reserva a mesa do planejamento até levantar os fardos e o TDP até terminar a deposição; quem está esperando um equipamento ocupado é o próximo a usá-lo, então os robôs se revezam. A colisão entre os braços não é simulada.
+
+### Perch
+
+Como na rotina MOVE_PERCH, quando não há ciclo para começar o robô vai para a posição de espera em cima da coleta da próxima mesa, na altura de infeed (topo da mesa + fardo + 0,35 m), com o cabeçote alinhado à mesa, e espera ali o Autoriza_Pick ou o pallet.
+
 O robô usa o cabeçote Selgron "MOD CAB 4 FARDOS" (0323P01-010000): quadro de 1234 × 500 mm com acoplamento 435 mm acima da base (o TCP fica na base do quadro, onde o topo dos fardos encosta), divisória central de 229 mm e duas pinças laterais de 295 mm acionadas pelos cilindros CIL 40-420. As pinças fecham sobre o grupo coletado e abrem ao depositar.
 
 ## Colocador de papelão (CP)
@@ -67,6 +97,12 @@ O carro do CP corre entre a posição de **pega**, sobre o depósito com a pilha
 - **Como parada do CVZ:** marque a caixa **CP** numa das paradas do carro. Depois de receber o pallet na coleta, o carro vai primeiro até essa parada, espera o papelão e só então segue para o destino.
 
 Sem CLP, a **lógica interna** porta os passos automáticos do FB CP (0–2, 100–117, 200/201, 400): desce na pilha, liga o vácuo ao perder os dois sensores, para no sensor superior, estabiliza, sobe, confere o sensor inferior (sem papelão → passo 400), vai à entrega, desce até o sensor superior, desliga o vácuo, sobe e volta. A opção **Aplicar 2x papelão** repete a aplicação. O botão **Reabastecer depósito** repõe a pilha. A escolha "aplicar ou não" por ID de linha do FB vem do CLP; internamente vale a opção **Aplicar papelão**.
+
+## Elevador de pallets (alimentador)
+
+Coloque o elevador centrado sobre um TDP (a **Altura do TDP** é a do topo dos roletes). A pilha fica levantada pelas garras no sensor **superior**. Em cada ciclo do FB (passos 100–111): com o TDP pronto para receber e sem pallet, desce até o sensor **inferior**, abre a garra (a pilha apoia no TDP), sobe até o sensor **intermediário** (uma altura de pallet), fecha no segundo pallet, espera o **TDP posterior pronto** e sobe a pilha até o superior. O pallet de baixo fica no TDP e segue; o FimDoCiclo volta a zero quando ele sai do sensor. Os passos de reconhecimento (0–43) e as falhas por tempo (400–402) também estão portados.
+
+Sem CLP, `TDPProntoReceber` vem do TDP sob o elevador (sem pallet sobre ele) e `TDPosteriorProntoReceber` fica ligado. Com a pilha vazia, o elevador espera embaixo com a luz **SEM PALLET NA PILHA**. **Reabastecer pilha** repõe a pilha; com **Abastecer automaticamente**, uma pilha cheia é colocada 3 s depois que o elevador fica vazio embaixo.
 
 ## Carro de pallet vazio (CVZ)
 
@@ -85,6 +121,7 @@ Sem CLP, a **lógica interna** porta o posicionamento do FB CVZ (passo 201): vel
 | TDP de paletização | Motor ligado, Batente de posicionamento | Pallet em posição, Pallet completo, Caixas no pallet (Int) |
 | FANUC M-410iC/185 | Liberar ciclo, Autoriza_Pick | Em ciclo, Robo_Fardos_Coletados, Pallet completo, Caixas no pallet (Int) |
 | Emissor / Magazine / Removedor | Emitir / Liberar pallet / Remover | — |
+| Elevador de pallets | MotorSobe, MotorDesce, Garra_Abrir, Garra_Fechar, TDPProntoReceber, TDPosteriorProntoReceber | SensorPosInferior, SensorPosInferiorMec, SensorPosIntermediario, SensorPosSuperior, SensorPosSuperiorMec, SensorGarraAberta, SensorGarraFechada, SensorPilhaPallet, SensorTDP |
 | Colocador de papelão (CP) | MotorPosicaoColeta, MotorPosicaoEntrega, CilindroAvancar, CilindroRecuar, Vacuo | LimitePega, LimiteEntrega, SensorCilindroAv, SensorCilindroRc, SensorPapelaoInferior, SensorPapelaoSuperior, SensorTDP |
 | Carro de pallet vazio (CVZ) | LigarDrive, LiberarFreio, Velocidade (Int mm/s), Motor_TDP, Reverso_TDP | PosicaoAtual (Int mm), DriverFDBVelocidade (Int mm/s), DriverEmFalha, SensorExtremoAtivoTDP, Sensor_Pallet_Carro |
 | Sensor fotoelétrico | — | Objeto detectado |
@@ -132,7 +169,8 @@ src/
   visuals.rs         malhas paramétricas (esteira, roletes, M-410iC/185, pallet...)
   editor.rs          câmera, seleção por raio, arrastar/girar/deletar/duplicar, gizmos
   sim.rs             fluxo de caixas, sensores, emissor/removedor, padrão de pallet
-  robot.rs           cinemática inversa 4 eixos e programa de paletização
+  robot.rs           cinemática inversa 4 eixos, programa de paletização, reservas entre robôs
+  elevator.rs        elevador/alimentador de pallets e port do FB
   io.rs              sinais <-> tags (forçado / CLP)
   communication.rs   thread S7: leitura cíclica agrupada e escrita por mudança
   s7.rs              cliente S7comm (COTP, setup, read/write var) e endereços TIA

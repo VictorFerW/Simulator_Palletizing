@@ -207,7 +207,9 @@ pub fn spawn_default_cell(commands: &mut Commands, meshes: &mut Assets<Mesh>, pa
     // The belt feeds the mesa entry lane (posição 1), offset from the mesa axis.
     let entry_lane = Params::for_kind(EquipmentKind::Table2Stage).box_size[2] / 2.0 + 0.01;
     add(EquipmentKind::Table2Stage, "Mesa2E_1", Vec3::new(-1.2, 0.0, -entry_lane), 0.0);
-    add(EquipmentKind::Robot, "FANUC_M410iC_1", Vec3::new(1.6, 0.0, 0.0), 0.0);
+    // J1 has ±180°: 0° points between the mesa (behind) and the pallet (side), so
+    // the transfers never cross the ±180° limit.
+    add(EquipmentKind::Robot, "FANUC_M410iC_1", Vec3::new(1.6, 0.0, 0.0), -135.0);
     // TDP 1560 mm modules, end to end.
     add(EquipmentKind::PalletConveyor, "TDP_1", Vec3::new(0.04, 0.0, 2.1), 0.0);
     add(EquipmentKind::PalletDispenser, "Magazine_1", Vec3::new(0.04, 0.0, 2.1), 0.0);

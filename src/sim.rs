@@ -429,7 +429,12 @@ pub fn mesa_mechanics(
                     continue;
                 }
                 let mut local = inverse.transform_point3(ltf.translation);
-                if local.x < pusher.x0 || local.x > pusher.x1 || (local.y - load.size.y / 2.0 - eq.params.height).abs() > 0.06 {
+                // Only fardos on this mesa (another mesa may run alongside at the same x).
+                if local.x < pusher.x0
+                    || local.x > pusher.x1
+                    || local.z.abs() > eq.params.width / 2.0 + 0.05
+                    || (local.y - load.size.y / 2.0 - eq.params.height).abs() > 0.06
+                {
                     continue;
                 }
                 let half_z = half_extent_along(ltf.rotation, load.size, tf.rotation * Vec3::Z);
@@ -765,6 +770,7 @@ pub fn reset_simulation(
     mut robots: Query<&mut crate::robot::RobotState>,
     mut emitters: Query<&mut EmitterState>,
     mut mesas: Query<(&Equipment, &mut crate::mesa_logic::MesaLogic, &mut MesaMech)>,
+    mut elevators: Query<(&Equipment, &mut crate::elevator::ElevatorState, &mut crate::elevator::ElevatorLogic)>,
 ) {
     if !control.reset_requested {
         return;
@@ -787,5 +793,9 @@ pub fn reset_simulation(
             *logic = fresh;
         }
         *mech = MesaMech::default();
+    }
+    for (eq, mut state, mut logic) in &mut elevators {
+        *state = crate::elevator::ElevatorState::new(&eq.params);
+        *logic = default();
     }
 }

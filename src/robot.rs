@@ -1,9 +1,12 @@
 //! FANUC M-410iC/185: 4-axis palletizing robot (J1 base rotation, J2/J3 arm
 //! with parallelograms keeping the wrist level, J4 flange yaw).
-//! Dimensions measured on the manufacturer's STEP model (robot on its pedestal):
-//! horizontal reach to the flange 3.164 m (data sheet: 3143 mm). The program
-//! below plays the role of the robot controller's palletizing routine.
+//! Dimensions measured on the manufacturer's STEP model (robot on its pedestal);
+//! axis ranges, speeds and the operating space follow the FANUC data sheet (see
+//! [`spec`]). Moves are joint (J) or linear (L) with a trapezoidal profile, like
+//! the controller. The program below plays the role of the Selgron TP routines
+//! (PICK, PLACE, MOVE_PERCH).
 
+use std::collections::HashMap;
 use std::f32::consts::{FRAC_PI_2, PI};
 
 use bevy::{math::Affine3A, prelude::*};
@@ -32,8 +35,91 @@ pub const TOOL_LENGTH: f32 = 0.435;
 pub const JAW_OPEN: f32 = 0.60;
 pub const JAW_HEIGHT: f32 = 0.295;
 pub const TCP_DROP: f32 = WRIST_DROP + TOOL_LENGTH;
-/// Horizontal reach limit used to pick the nearest conveyor/pallet automatically.
-pub const REACH: f32 = J2_OFFSET + WRIST_FWD + L1 + L2 - 0.1;
+/// Maximum reach of the flange center (data sheet), used to find conveyors in reach.
+pub const REACH: f32 = spec::REACH;
+
+/// FANUC data sheet, M-410iC/185 on the pedestal type base.
+pub mod spec {
+    const DEG: f32 = std::f32::consts::PI / 180.0;
+    pub const PAYLOAD_KG: f32 = 185.0;
+    pub const MASS_KG: f32 = 1600.0;
+    pub const REPEATABILITY_MM: f32 = 0.05;
+    /// Operating space of the wrist face plate center: reach, top and bottom
+    /// (from the floor), inner radius at floor level and rear interference radius.
+    pub const REACH: f32 = 3.143;
+    pub const MAX_HEIGHT: f32 = 2.397;
+    pub const MIN_HEIGHT: f32 = -0.561;
+    pub const MIN_RADIUS: f32 = 1.100;
+    pub const REAR_RADIUS: f32 = 0.725;
+    /// Maximum speeds J1..J4 (rad/s): 140, 140, 140, 305 °/s.
+    pub const SPEED: [f32; 4] = [140.0 * DEG, 140.0 * DEG, 140.0 * DEG, 305.0 * DEG];
+    /// Motion ranges J1..J4 (rad), totals 360°, 144°, 136°, 720°. J2 is the lower
+    /// arm from the vertical (forward positive), J3 the upper arm from the
+    /// horizontal (kept by the parallelogram), J4 the flange relative to J1. The
+    /// J2/J3 split reproduces the data sheet envelope: top 2397 mm, bottom -561 mm
+    /// and 1100 mm inner radius at the floor.
+    pub const MIN: [f32; 4] = [-180.0 * DEG, -44.0 * DEG, -126.0 * DEG, -360.0 * DEG];
+    pub const MAX: [f32; 4] = [180.0 * DEG, 100.0 * DEG, 10.0 * DEG, 360.0 * DEG];
+    /// Acceleration time of the trapezoidal speed profile (ACC 100).
+    pub const ACC_TIME: f32 = 0.35;
+}
+
+/// Axis positions J1..J4 (rad), see [`spec::MIN`] for their conventions.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Axes(pub [f32; 4]);
+
+impl Axes {
+    pub fn within_limits(&self) -> bool {
+        (0..4).all(|i| self.0[i] >= spec::MIN[i] - 1e-4 && self.0[i] <= spec::MAX[i] + 1e-4)
+    }
+
+    /// Forward kinematics: the TCP pose for these axes.
+    pub fn pose(&self) -> Pose {
+        let [j1, j2, j3, j4] = self.0;
+        let shoulder = FRAC_PI_2 - j2;
+        let wrist = Vec2::new(shoulder.cos(), shoulder.sin()) * L1 + Vec2::new(j3.cos(), j3.sin()) * L2;
+        Pose {
+            theta: j1,
+            r: J2_OFFSET + wrist.x + WRIST_FWD,
+            y: BASE_HEIGHT + wrist.y - TCP_DROP,
+            yaw: j4 + j1,
+        }
+    }
+}
+
+/// Outline of the operating space of the flange center in the arm plane:
+/// (radius from J1, height above the floor), around the J2/J3 limit rectangle.
+pub fn envelope_outline(steps: usize) -> Vec<Vec2> {
+    let (lo, hi) = (spec::MIN, spec::MAX);
+    let lerp = |a: f32, b: f32, k: usize| a + (b - a) * k as f32 / steps as f32;
+    let mut axes = Vec::new();
+    for k in 0..=steps {
+        axes.push((lerp(lo[1], hi[1], k), hi[2]));
+    }
+    for k in 0..=steps {
+        axes.push((hi[1], lerp(hi[2], lo[2], k)));
+    }
+    for k in 0..=steps {
+        axes.push((lerp(hi[1], lo[1], k), lo[2]));
+    }
+    for k in 0..=steps {
+        axes.push((lo[1], lerp(lo[2], hi[2], k)));
+    }
+    axes.into_iter()
+        .map(|(j2, j3)| {
+            let p = Axes([0.0, j2, j3, 0.0]).pose();
+            Vec2::new(p.r, p.y + TOOL_LENGTH)
+        })
+        .collect()
+}
+
+/// Kind of move, as in the TP routines: J (joint interpolated, % of the axis
+/// speeds) or L (straight line at a TCP speed in m/s).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Move {
+    Joint,
+    Linear(f32),
+}
 
 /// Pivots of the STEP model in its rest pose (lower arm vertical, upper arm
 /// horizontal), in the robot frame: (x forward, y up) of the arm plane.
@@ -167,13 +253,15 @@ impl Pose {
         }
     }
 
-    fn lerp(&self, to: &Self, t: f32) -> Self {
-        Self {
-            theta: self.theta + angle_diff(self.theta, to.theta) * t,
-            r: self.r + (to.r - self.r) * t,
-            y: self.y + (to.y - self.y) * t,
-            yaw: self.yaw + (to.yaw - self.yaw) * t,
-        }
+    /// Axis positions of this pose (J1 within ±180°, never wrapped).
+    pub fn axes(&self) -> Axes {
+        let joints = solve(self);
+        Axes([
+            self.theta,
+            FRAC_PI_2 - joints.shoulder,
+            joints.upper_dir.y.atan2(joints.upper_dir.x),
+            self.yaw - self.theta,
+        ])
     }
 }
 
@@ -205,8 +293,15 @@ pub struct RobotState {
     pub pose: Pose,
     from: Pose,
     to: Pose,
+    from_axes: Axes,
+    to_axes: Axes,
+    motion: Move,
     t: f32,
     duration: f32,
+    /// Acceleration time of the current move.
+    ramp: f32,
+    /// Axis speeds of the last frame (rad/s), for the property panel.
+    pub axis_speed: [f32; 4],
     pub step: Step,
     wait: f32,
     pub held: Vec<HeldBox>,
@@ -218,10 +313,16 @@ pub struct RobotState {
     pub unit: Vec3,
     pick_top: Vec3,
     pick_conveyor: Option<Entity>,
+    /// Last pick conveyor served (mesas take turns).
+    last_pick: Option<Entity>,
+    /// TDP of the current (or last) placement.
+    pub tdp: Option<Entity>,
     place: Option<(Entity, Vec3, f32)>,
     safe_y: f32,
     /// Robo_Fardos_Coletados.
     pub collected: bool,
+    /// Waiting at the perch (MOVE_PERCH) over the next coleta.
+    pub perched: bool,
     /// Clamp closure 0 (open) .. 1 (closed on the fardos).
     pub jaw: f32,
     pub status: String,
@@ -234,8 +335,13 @@ impl Default for RobotState {
             pose: Pose::HOME,
             from: Pose::HOME,
             to: Pose::HOME,
+            from_axes: Pose::HOME.axes(),
+            to_axes: Pose::HOME.axes(),
+            motion: Move::Joint,
             t: 0.0,
             duration: 0.0,
+            ramp: 0.0,
+            axis_speed: [0.0; 4],
             step: Step::Idle,
             wait: 0.0,
             held: Vec::new(),
@@ -245,9 +351,12 @@ impl Default for RobotState {
             unit: Vec3::ONE,
             pick_top: Vec3::ZERO,
             pick_conveyor: None,
+            last_pick: None,
+            tdp: None,
             place: None,
             safe_y: Pose::HOME.y,
             collected: false,
+            perched: false,
             jaw: 0.0,
             status: "Aguardando".into(),
             cycles: 0,
@@ -260,27 +369,66 @@ impl RobotState {
         self.t < self.duration
     }
 
-    fn move_to(&mut self, to: Pose, speed_override: f32, vertical: bool) {
+    /// Starts a move. Its duration is set by the slowest axis at its maximum speed
+    /// (and, for L moves, by the TCP speed), times the override (OVERRIDE=R[104]),
+    /// plus the acceleration ramps.
+    fn move_to(&mut self, to: Pose, speed_override: f32, motion: Move) {
         let ovr = speed_override.clamp(0.05, 1.0);
-        let from = self.pose;
-        let linear = if vertical { 1.2 } else { 3.0 } * ovr;
-        let angular = 2.4 * ovr;
-        let a = from.local_point();
-        let b = to.local_point();
-        let duration = [
-            angle_diff(from.theta, to.theta).abs() / angular,
-            (from.r - to.r).abs() / linear,
-            (from.y - to.y).abs() / linear,
-            (a - b).length() / (linear * 1.4),
-            (from.yaw - to.yaw).abs() / (4.0 * ovr),
-        ]
-        .into_iter()
-        .fold(0.12, f32::max);
-        self.from = from;
+        let (a, b) = (self.pose.axes(), to.axes());
+        let axes_time = (0..4).map(|i| (b.0[i] - a.0[i]).abs() / (spec::SPEED[i] * ovr)).fold(0.0, f32::max);
+        let travel = match motion {
+            Move::Joint => axes_time,
+            // On a line the axes do not all move at a constant rate: keep some margin.
+            Move::Linear(v) => ((to.local_point() - self.pose.local_point()).length() / (v * ovr)).max(axes_time * 1.15),
+        };
+        // Trapezoid: cruise time + one ramp; short moves never reach full speed.
+        let ramp = spec::ACC_TIME;
+        let duration = if travel >= ramp { travel + ramp } else { 2.0 * (travel * ramp).sqrt() };
+        self.from = self.pose;
         self.to = to;
+        self.from_axes = a;
+        self.to_axes = b;
+        self.motion = motion;
         self.t = 0.0;
-        self.duration = duration;
+        self.duration = duration.max(0.05);
+        self.ramp = ramp.min(self.duration / 2.0);
     }
+
+    /// Pose along the current move at time `t`.
+    fn pose_at(&self, t: f32) -> Pose {
+        let k = trapezoid(t, self.duration, self.ramp);
+        match self.motion {
+            Move::Joint => {
+                let mut q = [0.0; 4];
+                for (i, v) in q.iter_mut().enumerate() {
+                    *v = self.from_axes.0[i] + (self.to_axes.0[i] - self.from_axes.0[i]) * k;
+                }
+                Axes(q).pose()
+            }
+            Move::Linear(_) => {
+                let p = self.from.local_point().lerp(self.to.local_point(), k);
+                Pose::from_local(p, self.from.yaw + (self.to.yaw - self.from.yaw) * k)
+            }
+        }
+    }
+}
+
+/// Fraction of the path covered at `t` with a trapezoidal speed profile.
+fn trapezoid(t: f32, total: f32, ramp: f32) -> f32 {
+    if total <= 0.0 {
+        return 1.0;
+    }
+    let t = t.clamp(0.0, total);
+    let cruise = total - ramp; // peak speed = 1 / cruise
+    let s = if t < ramp {
+        t * t / (2.0 * ramp)
+    } else if t <= total - ramp {
+        ramp / 2.0 + (t - ramp)
+    } else {
+        let left = total - t;
+        cruise - left * left / (2.0 * ramp)
+    };
+    (s / cruise).clamp(0.0, 1.0)
 }
 
 pub struct Joints {
@@ -299,22 +447,27 @@ pub fn solve(pose: &Pose) -> Joints {
     let h = pose.y + TCP_DROP - BASE_HEIGHT;
     let target = Vec2::new(r, h);
     let d = target.length();
-    let reachable = d <= L1 + L2 - 1e-3 && d >= (L1 - L2).abs() + 1e-3 && pose.y >= -0.05;
+    let in_plane = d <= L1 + L2 - 1e-3 && d >= (L1 - L2).abs() + 1e-3 && pose.y >= -0.05;
     let dc = d.clamp((L1 - L2).abs() + 1e-3, L1 + L2 - 1e-3);
     let cos_inner = ((L1 * L1 + dc * dc - L2 * L2) / (2.0 * L1 * dc)).clamp(-1.0, 1.0);
     let shoulder = h.atan2(r) + cos_inner.acos();
     let elbow = Vec2::new(L1 * shoulder.cos(), L1 * shoulder.sin());
-    let wrist = if reachable {
+    let wrist = if in_plane {
         target
     } else {
         elbow + (target - elbow).normalize_or_zero() * L2
     };
+    let upper_dir = (wrist - elbow).normalize_or_zero();
+    // Axis limits of the data sheet (J2 from the vertical, J3 from the horizontal).
+    let j2 = FRAC_PI_2 - shoulder;
+    let j3 = upper_dir.y.atan2(upper_dir.x);
+    let axes = Axes([pose.theta, j2, j3, pose.yaw - pose.theta]);
     Joints {
         j1: pose.theta,
         shoulder,
         elbow,
-        upper_dir: (wrist - elbow).normalize_or_zero(),
-        reachable,
+        upper_dir,
+        reachable: in_plane && axes.within_limits(),
     }
 }
 
@@ -327,24 +480,159 @@ fn link_rotation(j1: f32, plane_angle: f32) -> Quat {
     Quat::from_rotation_y(j1) * Quat::from_rotation_z(plane_angle - FRAC_PI_2)
 }
 
-/// Shortest signed difference `to - from` in radians.
-fn angle_diff(from: f32, to: f32) -> f32 {
-    (to - from + PI).rem_euclid(2.0 * PI) - PI
-}
-
 /// Picks `target + k*PI` closest to `current` (boxes are symmetric under 180°).
 fn nearest_half_turn(current: f32, target: f32) -> f32 {
     let k = ((current - target) / PI).round();
     target + k * PI
 }
 
-fn smooth(t: f32) -> f32 {
-    let t = t.clamp(0.0, 1.0);
-    t * t * (3.0 - 2.0 * t)
+/// Gripper yaw for `target` (any half turn) closest to `current`, keeping J4
+/// (yaw relative to J1 at `theta`) inside its ±360° range.
+fn wrist_yaw(current: f32, target: f32, theta: f32) -> f32 {
+    (-8..=8)
+        .map(|k| target + k as f32 * PI)
+        .filter(|y| (y - theta).abs() <= spec::MAX[3])
+        .min_by(|a, b| (a - current).abs().total_cmp(&(b - current).abs()))
+        .unwrap_or_else(|| nearest_half_turn(current, target))
 }
 
 pub fn yaw_of(rotation: Quat) -> f32 {
     rotation.to_euler(EulerRot::YXZ).0
+}
+
+/// Equipment robots are working on, so robots sharing mesas or TDPs take turns:
+/// a pick conveyor is reserved from planning until the fardos are lifted, a TDP
+/// until the placement is done.
+#[derive(Default)]
+pub struct Claims {
+    owner: HashMap<Entity, Entity>,
+    /// Robot waiting for equipment another robot holds: it is next in line.
+    waiting: HashMap<Entity, Entity>,
+}
+
+impl Claims {
+    fn available(&self, target: Entity, robot: Entity) -> bool {
+        self.owner.get(&target).is_none_or(|r| *r == robot) && self.waiting.get(&target).is_none_or(|r| *r == robot)
+    }
+}
+
+/// One planned pick-and-place.
+struct Plan {
+    held: Vec<HeldBox>,
+    unit: Vec3,
+    group_yaw: f32,
+    pick_top: Vec3,
+    place: (Entity, Vec3, f32),
+    safe_y: f32,
+    above: Pose,
+}
+
+type LoadQuery<'w, 's> = Query<'w, 's, (Entity, &'static mut Load, &'static mut Transform), Without<Equipment>>;
+
+/// Plans taking everything resting in the pick area of `pick` (a pair of fardos
+/// on a mesa, one box on a belt) to the next slot of the pallet on `tdp`.
+#[allow(clippy::too_many_arguments)]
+fn plan_cycle(
+    state: &RobotState,
+    robot_tf: &Transform,
+    world_to_local: &Affine3A,
+    (pick_eq, pick_tf): (&Equipment, &Transform),
+    (tdp_eq, pallet_entity): (&Equipment, Entity),
+    loads: &LoadQuery,
+    pallet_loads: &Query<&mut PalletLoad>,
+) -> Result<Plan, &'static str> {
+    let robot_yaw = yaw_of(robot_tf.rotation);
+    let mut group: Vec<(Entity, Vec3, Quat, Vec3)> = loads
+        .iter()
+        .filter(|(_, l, tf)| l.kind == LoadKind::Box && l.state == LoadState::Free && sim::in_pick_area(pick_eq, pick_tf, l.size, tf))
+        .map(|(e, l, tf)| (e, tf.translation, tf.rotation, l.size))
+        .collect();
+    if !pick_eq.kind.is_mesa() {
+        group.truncate(1);
+    }
+    if group.is_empty() {
+        return Err("Aguardando produto na coleta");
+    }
+    let Ok((_, pallet, pallet_tf)) = loads.get(pallet_entity) else {
+        return Err("Aguardando pallet em posição");
+    };
+    let (pallet_size, pallet_tf) = (pallet.size, *pallet_tf);
+
+    // Group frame = pick conveyor frame; offsets of each box from the group center.
+    let group_yaw = yaw_of(pick_tf.rotation);
+    let to_group = Quat::from_rotation_y(-group_yaw);
+    let (mut min, mut max) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+    for (_, pos, rot, size) in &group {
+        let local = to_group * *pos;
+        let rel = to_group * *rot;
+        let hx = half_extent_along(rel, *size, Vec3::X);
+        let hz = half_extent_along(rel, *size, Vec3::Z);
+        min = min.min(Vec3::new(local.x - hx, 0.0, local.z - hz));
+        max = max.max(Vec3::new(local.x + hx, 0.0, local.z + hz));
+    }
+    let height = group.iter().map(|g| g.3.y).fold(0.0, f32::max);
+    let center = Quat::from_rotation_y(group_yaw) * ((min + max) / 2.0);
+    let top = group.iter().map(|g| g.1.y + g.3.y / 2.0).fold(f32::MIN, f32::max);
+    let held = group
+        .iter()
+        .map(|(e, pos, rot, size)| HeldBox {
+            entity: *e,
+            offset: to_group * (*pos - Vec3::new(center.x, pos.y, center.z)),
+            rel_yaw: yaw_of(*rot) - group_yaw,
+            height: size.y,
+        })
+        .collect();
+    let pick_top = Vec3::new(center.x, top, center.z);
+
+    // The pallet pattern keeps the footprint of its first placement.
+    let unit = Vec3::new(max.x - min.x, height, max.z - min.z);
+    let content = pallet_loads.get(pallet_entity).ok();
+    let units_done = content.map_or(0, |p| p.units);
+    let unit = content.and_then(|p| p.unit_size).unwrap_or(unit);
+    let Some((slot_local, slot_yaw)) = sim::pallet_slot(&tdp_eq.params, pallet_size, unit, units_done) else {
+        return Err("Pallet completo");
+    };
+    // Stack on top of the cardboard sheets.
+    let sheets = content.map_or(0, |p| p.sheets);
+    let slot_local = slot_local + Vec3::Y * sheets as f32 * crate::paper::SHEET_THICKNESS;
+    let place_top = pallet_tf.transform_point(slot_local + Vec3::Y * unit.y / 2.0);
+    let local_pick = world_to_local.transform_point3(pick_top);
+    let local_place = world_to_local.transform_point3(place_top);
+    let pick_pose = Pose::from_local(local_pick, 0.0);
+    let place_pose = Pose::from_local(local_place, 0.0);
+    if !solve(&pick_pose).reachable || !solve(&place_pose).reachable {
+        return Err("Coleta ou posição no pallet fora do alcance");
+    }
+    let safe_y = local_pick.y.max(local_place.y) + 0.35;
+    let grip_yaw = wrist_yaw(state.pose.yaw, group_yaw - robot_yaw, pick_pose.theta);
+    Ok(Plan {
+        held,
+        unit,
+        group_yaw,
+        pick_top,
+        place: (pallet_entity, slot_local, slot_yaw),
+        safe_y,
+        above: Pose { y: safe_y, yaw: grip_yaw, ..pick_pose },
+    })
+}
+
+/// Perch (wait) pose of MOVE_PERCH: over the middle of the pick area, the
+/// gripper aligned with the conveyor, high enough to clear the incoming fardos.
+fn perch_pose(state: &RobotState, world_to_local: &Affine3A, robot_yaw: f32, pick_eq: &Equipment, pick_tf: &Transform) -> Option<Pose> {
+    let p = &pick_eq.params;
+    let end = p.length / 2.0;
+    let x = crate::conveyor::layout(pick_eq).pick_x0.map_or(end - 0.3, |x0| (x0 + end) / 2.0);
+    let world = pick_tf.transform_point(Vec3::new(x, p.height + p.box_size[1] + 0.35, 0.0));
+    let local = world_to_local.transform_point3(world);
+    let theta = Pose::from_local(local, 0.0).theta;
+    let yaw = wrist_yaw(state.pose.yaw, yaw_of(pick_tf.rotation) - robot_yaw, theta);
+    let pose = Pose::from_local(local, yaw);
+    solve(&pose).reachable.then_some(pose)
+}
+
+/// Listed names first, in list order, then the rest by name.
+fn list_order(names: &[String], name: &str) -> (usize, String) {
+    (names.iter().position(|n| n == name).unwrap_or(usize::MAX), name.to_owned())
 }
 
 #[allow(clippy::type_complexity, clippy::too_many_arguments)]
@@ -352,15 +640,20 @@ pub fn robot_program(
     time: Res<Time>,
     control: Res<crate::model::SimControl>,
     mut commands: Commands,
-    mut robots: Query<(&Equipment, &Transform, &mut RobotState, &mut Io), Without<Load>>,
+    mut claims: Local<Claims>,
+    mut robots: Query<(Entity, &Equipment, &Transform, &mut RobotState, &mut Io), Without<Load>>,
     equipment: Query<(Entity, &Equipment, &Transform), (Without<Load>, Without<RobotState>)>,
     palletizers: Query<&PalletizerState>,
     mut mesas: Query<&mut MesaLogic>,
-    mut loads: Query<(Entity, &mut Load, &mut Transform), Without<Equipment>>,
+    mut loads: LoadQuery,
     mut pallet_loads: Query<&mut PalletLoad>,
 ) {
     let dt = if control.running { time.delta_secs() * control.time_scale } else { 0.0 };
-    for (robot_eq, robot_tf, mut state, mut io) in &mut robots {
+    // Forget robots that were deleted.
+    let alive: Vec<Entity> = robots.iter().map(|r| r.0).collect();
+    claims.owner.retain(|_, r| alive.contains(r));
+    claims.waiting.retain(|_, r| alive.contains(r));
+    for (robot_entity, robot_eq, robot_tf, mut state, mut io) in &mut robots {
         let params = &robot_eq.params;
         let world_to_local = robot_tf.compute_affine().inverse();
         let robot_yaw = yaw_of(robot_tf.rotation);
@@ -369,169 +662,172 @@ pub fn robot_program(
             Vec2::new(local.x, local.z).length() <= REACH + margin
         };
 
-        // Pick conveyor (mesa coleta or belt end) and palletizing TDP, by name or nearest in reach.
-        let pick = equipment
+        // Pick conveyors (mesa coletas, belt ends) and palletizing TDPs in reach: the
+        // listed ones, or every one. Mesas take turns (round robin); the TDP with the
+        // most advanced pallet comes first, so pallets are completed one at a time.
+        let mut picks: Vec<(Entity, &Equipment, &Transform)> = equipment
             .iter()
             .filter(|(_, e, _)| e.kind.is_product_conveyor())
-            .filter(|(_, e, _)| params.pick_from.is_empty() || e.name == params.pick_from)
-            .map(|(entity, e, tf)| {
-                let end = tf.transform_point(Vec3::new(e.params.length / 2.0 - 0.3, e.params.height, 0.0));
-                (entity, e, tf, end)
-            })
-            .filter(|(.., end)| in_reach(*end, 0.0))
-            .min_by(|a, b| {
-                a.3.distance_squared(robot_tf.translation)
-                    .total_cmp(&b.3.distance_squared(robot_tf.translation))
-            });
-        let palletizer = equipment
+            .filter(|(_, e, _)| params.pick_from.is_empty() || params.pick_from.contains(&e.name))
+            .filter(|(_, e, tf)| in_reach(tf.transform_point(Vec3::new(e.params.length / 2.0 - 0.3, e.params.height, 0.0)), 0.0))
+            .collect();
+        picks.sort_by_cached_key(|(_, e, _)| list_order(&params.pick_from, &e.name));
+        if let Some(i) = picks.iter().position(|p| Some(p.0) == state.last_pick) {
+            picks.rotate_left(i + 1);
+        }
+        let mut tdps: Vec<(Entity, &Equipment, Option<&PalletizerState>)> = equipment
             .iter()
             .filter(|(_, e, _)| e.kind == EquipmentKind::PalletizingConveyor)
-            .filter(|(_, e, _)| params.place_on.is_empty() || e.name == params.place_on)
+            .filter(|(_, e, _)| params.place_on.is_empty() || params.place_on.contains(&e.name))
             .filter(|(_, _, tf)| in_reach(tf.translation, 0.8))
-            .min_by(|a, b| {
-                a.2.translation
-                    .distance_squared(robot_tf.translation)
-                    .total_cmp(&b.2.translation.distance_squared(robot_tf.translation))
-            });
-        let tdp_state = palletizer.and_then(|(e, ..)| palletizers.get(e).ok());
+            .map(|(entity, e, _)| (entity, e, palletizers.get(entity).ok()))
+            .collect();
+        tdps.sort_by_cached_key(|(_, e, _)| list_order(&params.place_on, &e.name));
+        tdps.sort_by_key(|(.., s)| std::cmp::Reverse(s.filter(|s| s.pallet.is_some()).map_or(0, |s| s.units)));
+        let tdp_state = state.tdp.or(tdps.first().map(|t| t.0)).and_then(|e| palletizers.get(e).ok());
 
         'logic: {
             if dt <= 0.0 {
                 break 'logic;
             }
             if state.moving() {
+                let before = state.pose.axes();
                 state.t += dt;
-                let k = smooth(state.t / state.duration);
-                state.pose = state.from.lerp(&state.to, k);
+                state.pose = state.pose_at(state.t);
+                let after = state.pose.axes();
+                state.axis_speed = std::array::from_fn(|i| (after.0[i] - before.0[i]) / dt);
                 break 'logic;
             }
+            state.axis_speed = [0.0; 4];
             if state.wait > 0.0 {
                 state.wait -= dt;
                 break 'logic;
             }
             match state.step {
                 Step::Idle => {
-                    let Some((pick_entity, pick_eq, pick_tf, _)) = pick else {
+                    // Release what this robot used in the last cycle.
+                    claims.owner.retain(|_, r| *r != robot_entity);
+                    claims.waiting.retain(|_, r| *r != robot_entity);
+                    if picks.is_empty() {
                         state.status = "Sem mesa/esteira de coleta ao alcance".into();
                         break 'logic;
-                    };
-                    let Some((_, tdp_eq, _)) = palletizer else {
+                    }
+                    if tdps.is_empty() {
                         state.status = "Sem TDP de paletização ao alcance".into();
                         break 'logic;
-                    };
+                    }
                     if !io.get_bool("start") {
                         state.status = "Aguardando liberação (start)".into();
                         break 'logic;
                     }
-                    let Some(tdp) = tdp_state.filter(|s| s.pallet.is_some()) else {
-                        state.status = "Aguardando pallet em posição".into();
+                    let mut status: Option<&'static str> = None;
+                    let mut wait_for = Vec::new();
+                    let mut chosen = None;
+                    'search: for &(tdp_entity, tdp_eq, tdp) in &tdps {
+                        let Some(pallet_entity) = tdp.and_then(|t| t.pallet) else {
+                            status.get_or_insert("Aguardando pallet em posição");
+                            continue;
+                        };
+                        if tdp.is_some_and(|t| t.full) {
+                            status.get_or_insert("Pallet completo");
+                            continue;
+                        }
+                        if loads.get(pallet_entity).is_ok_and(|(_, l, _)| l.hold) {
+                            status.get_or_insert("Aguardando colocador de papelão");
+                            continue;
+                        }
+                        if !claims.available(tdp_entity, robot_entity) {
+                            wait_for.push(tdp_entity);
+                            status.get_or_insert("TDP em uso por outro robô");
+                            continue;
+                        }
+                        for &(pick_entity, pick_eq, pick_tf) in &picks {
+                            if !claims.available(pick_entity, robot_entity) {
+                                wait_for.push(pick_entity);
+                                status.get_or_insert("Coleta em uso por outro robô");
+                                continue;
+                            }
+                            // Autoriza_Pick: from the PLC, else from the mesa's internal logic.
+                            let mesa_logic = mesas.get(pick_entity).ok().filter(|_| pick_eq.params.auto_logic);
+                            let authorized = if io.from_plc.contains("Autoriza_Pick") {
+                                io.get_bool("Autoriza_Pick")
+                            } else if let Some(logic) = mesa_logic {
+                                logic.coleta.autoriza_pick
+                            } else {
+                                io.get_bool("Autoriza_Pick")
+                            };
+                            if !authorized {
+                                status.get_or_insert("Aguardando Autoriza_Pick da coleta");
+                                continue;
+                            }
+                            match plan_cycle(
+                                &state,
+                                robot_tf,
+                                &world_to_local,
+                                (pick_eq, pick_tf),
+                                (tdp_eq, pallet_entity),
+                                &loads,
+                                &pallet_loads,
+                            ) {
+                                Ok(plan) => {
+                                    chosen = Some((pick_entity, tdp_entity, plan));
+                                    break 'search;
+                                }
+                                Err(reason) => {
+                                    status.get_or_insert(reason);
+                                }
+                            }
+                        }
+                    }
+                    let Some((pick_entity, tdp_entity, plan)) = chosen else {
+                        // Next in line for what another robot is using.
+                        for target in wait_for {
+                            claims.waiting.entry(target).or_insert(robot_entity);
+                        }
+                        state.status = status.unwrap_or("Aguardando").into();
+                        // MOVE_PERCH: wait over the coleta of the next mesa, at the infeed height.
+                        if !state.perched
+                            && let Some(&(_, pick_eq, pick_tf)) = picks.first()
+                            && let Some(perch) = perch_pose(&state, &world_to_local, robot_yaw, pick_eq, pick_tf)
+                        {
+                            state.perched = true;
+                            state.status = format!("Perch: {}", state.status);
+                            state.move_to(perch, params.speed_override, Move::Joint);
+                        }
                         break 'logic;
                     };
-                    if tdp.full {
-                        state.status = "Pallet completo".into();
-                        break 'logic;
+                    state.perched = false;
+                    if std::env::var("PDT_TRACE").is_ok() {
+                        let name = |e: Entity| equipment.get(e).map_or("?", |(_, eq, _)| eq.name.as_str());
+                        eprintln!(
+                            "[{:.2}] {}: coleta {} -> {}",
+                            time.elapsed_secs(),
+                            robot_eq.name,
+                            name(pick_entity),
+                            name(tdp_entity)
+                        );
                     }
-                    if loads.get(tdp.pallet.expect("checked")).is_ok_and(|(_, l, _)| l.hold) {
-                        state.status = "Aguardando colocador de papelão".into();
-                        break 'logic;
-                    }
-                    // Autoriza_Pick: from the PLC, else from the mesa's internal logic.
-                    let mesa_logic = mesas.get(pick_entity).ok().filter(|_| pick_eq.params.auto_logic);
-                    let authorized = if io.from_plc.contains("Autoriza_Pick") {
-                        io.get_bool("Autoriza_Pick")
-                    } else if let Some(logic) = mesa_logic {
-                        logic.coleta.autoriza_pick
-                    } else {
-                        io.get_bool("Autoriza_Pick")
-                    };
-                    if !authorized {
-                        state.status = "Aguardando Autoriza_Pick da coleta".into();
-                        break 'logic;
-                    }
-                    // Everything resting in the pick area is taken in one pick (a pair of fardos on a mesa).
-                    let mut group: Vec<(Entity, Vec3, Quat, Vec3)> = loads
-                        .iter()
-                        .filter(|(_, l, tf)| {
-                            l.kind == LoadKind::Box && l.state == LoadState::Free && sim::in_pick_area(pick_eq, pick_tf, l.size, tf)
-                        })
-                        .map(|(e, l, tf)| (e, tf.translation, tf.rotation, l.size))
-                        .collect();
-                    if !pick_eq.kind.is_mesa() {
-                        group.truncate(1);
-                    }
-                    if group.is_empty() {
-                        state.status = "Aguardando produto na coleta".into();
-                        break 'logic;
-                    }
-                    let Ok((_, pallet, pallet_tf)) = loads.get(tdp.pallet.expect("checked")) else { break 'logic };
-                    let (pallet_entity, pallet_size, pallet_tf) = (tdp.pallet.expect("checked"), pallet.size, *pallet_tf);
-
-                    // Group frame = pick conveyor frame; offsets of each box from the group center.
-                    let group_yaw = yaw_of(pick_tf.rotation);
-                    let to_group = Quat::from_rotation_y(-group_yaw);
-                    let (mut min, mut max) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
-                    for (_, pos, rot, size) in &group {
-                        let local = to_group * *pos;
-                        let rel = to_group * *rot;
-                        let hx = half_extent_along(rel, *size, Vec3::X);
-                        let hz = half_extent_along(rel, *size, Vec3::Z);
-                        min = min.min(Vec3::new(local.x - hx, 0.0, local.z - hz));
-                        max = max.max(Vec3::new(local.x + hx, 0.0, local.z + hz));
-                    }
-                    let height = group.iter().map(|g| g.3.y).fold(0.0, f32::max);
-                    let center_local = (min + max) / 2.0;
-                    let center = Quat::from_rotation_y(group_yaw) * center_local;
-                    let top = group.iter().map(|g| g.1.y + g.3.y / 2.0).fold(f32::MIN, f32::max);
-                    let unit = Vec3::new(max.x - min.x, height, max.z - min.z);
-                    state.held_plan = group
-                        .iter()
-                        .map(|(e, pos, rot, size)| HeldBox {
-                            entity: *e,
-                            offset: to_group * (*pos - Vec3::new(center.x, pos.y, center.z)),
-                            rel_yaw: yaw_of(*rot) - group_yaw,
-                            height: size.y,
-                        })
-                        .collect();
-                    state.unit = unit;
-                    state.group_yaw = group_yaw;
-                    state.pick_top = Vec3::new(center.x, top, center.z);
-
-                    // The pallet pattern keeps the footprint of its first placement.
-                    let (units_done, unit) = pallet_loads
-                        .get(pallet_entity)
-                        .map_or((0, unit), |p| (p.units, p.unit_size.unwrap_or(unit)));
-                    state.unit = unit;
-                    let Some((slot_local, slot_yaw)) = sim::pallet_slot(&tdp_eq.params, pallet_size, unit, units_done) else {
-                        state.status = "Pallet completo".into();
-                        break 'logic;
-                    };
-                    // Stack on top of the cardboard sheets.
-                    let sheets = pallet_loads.get(pallet_entity).map_or(0, |p| p.sheets);
-                    let slot_local = slot_local + Vec3::Y * sheets as f32 * crate::paper::SHEET_THICKNESS;
-                    let place_top = pallet_tf.transform_point(slot_local + Vec3::Y * unit.y / 2.0);
-                    let local_pick = world_to_local.transform_point3(state.pick_top);
-                    let local_place = world_to_local.transform_point3(place_top);
-                    let pick_pose = Pose::from_local(local_pick, 0.0);
-                    let place_pose = Pose::from_local(local_place, 0.0);
-                    if !solve(&pick_pose).reachable || !solve(&place_pose).reachable {
-                        state.status = "Coleta ou posição no pallet fora do alcance".into();
-                        break 'logic;
-                    }
-                    state.safe_y = local_pick.y.max(local_place.y) + 0.35;
-                    let grip_yaw = nearest_half_turn(state.pose.yaw, group_yaw - robot_yaw);
-                    let above = Pose { y: state.safe_y, yaw: grip_yaw, ..pick_pose };
+                    claims.owner.insert(pick_entity, robot_entity);
+                    claims.owner.insert(tdp_entity, robot_entity);
+                    state.held_plan = plan.held;
+                    state.unit = plan.unit;
+                    state.group_yaw = plan.group_yaw;
+                    state.pick_top = plan.pick_top;
+                    state.safe_y = plan.safe_y;
                     state.pick_conveyor = Some(pick_entity);
-                    state.place = Some((pallet_entity, slot_local, slot_yaw));
+                    state.last_pick = Some(pick_entity);
+                    state.tdp = Some(tdp_entity);
+                    state.place = Some(plan.place);
                     state.status = "Indo para coleta".into();
                     state.step = Step::ToAbovePick;
-                    state.move_to(above, params.speed_override, false);
+                    state.move_to(plan.above, params.speed_override, Move::Joint);
                 }
                 Step::ToAbovePick => {
                     let local = world_to_local.transform_point3(state.pick_top);
                     let target = Pose { yaw: state.pose.yaw, ..Pose::from_local(local, 0.0) };
                     state.step = Step::DownPick;
                     state.status = "Descendo para coleta".into();
-                    state.move_to(target, params.speed_override, true);
+                    state.move_to(target, params.speed_override, Move::Linear(3.0)); // PICK: L PR[3] 3000mm/sec
                 }
                 Step::DownPick => {
                     state.step = Step::Grip;
@@ -559,7 +855,7 @@ pub fn robot_program(
                     state.held = held;
                     state.step = Step::UpPick;
                     let up = Pose { y: state.safe_y, ..state.pose };
-                    state.move_to(up, params.speed_override, true);
+                    state.move_to(up, params.speed_override, Move::Linear(1.8)); // PICK: L PR[11] 1800mm/sec
                 }
                 Step::UpPick | Step::ToAbovePlace => {
                     if state.step == Step::UpPick {
@@ -567,6 +863,12 @@ pub fn robot_program(
                         state.collected = true;
                         if let Some(mut logic) = state.pick_conveyor.and_then(|e| mesas.get_mut(e).ok()) {
                             logic.robot_collected = true;
+                        }
+                        // The coleta is free for the other robots.
+                        if let Some(pick) = state.pick_conveyor
+                            && claims.owner.get(&pick) == Some(&robot_entity)
+                        {
+                            claims.owner.remove(&pick);
                         }
                     }
                     let Some((pallet_entity, slot_local, slot_yaw)) = state.place else {
@@ -583,16 +885,17 @@ pub fn robot_program(
                     let local = world_to_local.transform_point3(place_top);
                     let unit_yaw = yaw_of(pallet_tf.rotation) + slot_yaw;
                     if state.step == Step::UpPick {
-                        let yaw = nearest_half_turn(state.pose.yaw, unit_yaw - state.hold_yaw - robot_yaw);
-                        let target = Pose { y: state.safe_y, yaw, ..Pose::from_local(local, 0.0) };
+                        let above = Pose::from_local(local, 0.0);
+                        let yaw = wrist_yaw(state.pose.yaw, unit_yaw - state.hold_yaw - robot_yaw, above.theta);
+                        let target = Pose { y: state.safe_y, yaw, ..above };
                         state.step = Step::ToAbovePlace;
                         state.status = "Transportando para o pallet".into();
-                        state.move_to(target, params.speed_override, false);
+                        state.move_to(target, params.speed_override, Move::Joint); // PLACE: J PR[11] 100%
                     } else {
                         let target = Pose { yaw: state.pose.yaw, ..Pose::from_local(local, 0.0) };
                         state.step = Step::DownPlace;
                         state.status = "Depositando".into();
-                        state.move_to(target, params.speed_override, true);
+                        state.move_to(target, params.speed_override, Move::Linear(2.0)); // PLACE: L PR[5] 2000mm/sec
                     }
                 }
                 Step::DownPlace => {
@@ -601,6 +904,9 @@ pub fn robot_program(
                     state.status = "Abrindo garra".into();
                 }
                 Step::Release => {
+                    if std::env::var("PDT_TRACE").is_ok() {
+                        eprintln!("[{:.2}] {}: depositado", time.elapsed_secs(), robot_eq.name);
+                    }
                     let held = std::mem::take(&mut state.held);
                     if let Some((pallet_entity, slot_local, slot_yaw)) = state.place {
                         // The fardos become part of the pallet load and travel with it.
@@ -629,7 +935,7 @@ pub fn robot_program(
                     }
                     state.step = Step::UpPlace;
                     let up = Pose { y: state.safe_y, ..state.pose };
-                    state.move_to(up, params.speed_override, true);
+                    state.move_to(up, params.speed_override, Move::Linear(4.0)); // PLACE: L PR[11] 4000mm/sec
                 }
                 Step::UpPlace => {
                     state.step = Step::Idle;
@@ -753,6 +1059,38 @@ mod tests {
             assert!(tf.translation.length() < 1e-3, "{part:?} {:?}", tf.translation);
             assert!(tf.rotation.angle_between(Quat::IDENTITY) < 1e-3, "{part:?}");
         }
+    }
+
+    #[test]
+    fn envelope_matches_data_sheet() {
+        // Top of the operating space: J2 vertical, J3 at its upper limit.
+        let top = Axes([0.0, 0.0, spec::MAX[2], 0.0]).pose().y + TOOL_LENGTH;
+        assert!((top - spec::MAX_HEIGHT).abs() < 0.01, "{top}");
+        // Inner radius where the envelope crosses the floor, and its bottom.
+        let outline = envelope_outline(400);
+        let inner = outline
+            .windows(2)
+            .filter(|w| (w[0].y >= 0.0) != (w[1].y >= 0.0))
+            .map(|w| w[0].x)
+            .fold(f32::MAX, f32::min);
+        assert!((inner - spec::MIN_RADIUS).abs() < 0.03, "{inner}");
+        let bottom = outline.iter().map(|p| p.y).fold(f32::MAX, f32::min);
+        assert!((bottom - spec::MIN_HEIGHT).abs() < 0.03, "{bottom}");
+    }
+
+    #[test]
+    fn axes_round_trip() {
+        let pose = Pose { theta: -1.2, r: 2.4, y: 0.8, yaw: 0.5 };
+        let back = pose.axes().pose();
+        assert!((back.local_point() - pose.local_point()).length() < 1e-3);
+        assert!((back.yaw - pose.yaw).abs() < 1e-5);
+    }
+
+    #[test]
+    fn trapezoid_profile() {
+        assert_eq!(trapezoid(0.0, 2.0, 0.35), 0.0);
+        assert!((trapezoid(2.0, 2.0, 0.35) - 1.0).abs() < 1e-6);
+        assert!((trapezoid(1.0, 2.0, 0.35) - 0.5).abs() < 1e-6);
     }
 
     #[test]

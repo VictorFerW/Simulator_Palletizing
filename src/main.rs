@@ -1,6 +1,7 @@
 mod communication;
 mod conveyor;
 mod editor;
+mod elevator;
 mod io;
 mod layout;
 mod mesa_logic;
@@ -75,12 +76,14 @@ fn main() {
                         mesa_logic::run_mesas,
                         shuttle::shuttle_logic,
                         paper::paper_logic,
+                        elevator::elevator_logic,
                     )
                         .chain(),
                     // Physics, sensors and outputs.
                     (
                         shuttle::shuttle_motion,
                         paper::paper_hold,
+                        elevator::elevator_mechanics,
                         sim::emitters,
                         sim::move_loads,
                         paper::paper_mechanics,
@@ -93,6 +96,7 @@ fn main() {
                         sim::animate_conveyors,
                         shuttle::animate_shuttle,
                         paper::animate_paper,
+                        elevator::animate_elevators,
                         io::publish_outputs,
                     )
                         .chain(),

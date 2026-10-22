@@ -7,8 +7,9 @@ use crate::editor::{EditRequests, EditorSettings, UiFocus};
 use crate::io::{PlcConnection, PlcLink, default_manual, resolve_tag};
 use crate::layout::LayoutRequests;
 use crate::model::{Equipment, EquipmentKind, Io, NeedsRebuild, Selection, SignalDir, SignalType, SimControl, TagBindings};
-use crate::robot::{RobotState, yaw_of};
+use crate::robot::{RobotState, spec, yaw_of};
 use crate::mesa_logic::MesaLogic;
+use crate::elevator::{ElevatorLogic, ElevatorState, MAX_STACK};
 use crate::paper::{PaperPlacerLogic, PaperPlacerState};
 use crate::shuttle::{ShuttleLogic, ShuttleState};
 use crate::sim::{Load, PalletizerState};
@@ -77,6 +78,9 @@ fn default_helper_path() -> String {
     candidates[0].into()
 }
 
+type PlacerQuery<'w, 's> = Query<'w, 's, (&'static mut PaperPlacerState, &'static PaperPlacerLogic)>;
+type ElevatorQuery<'w, 's> = Query<'w, 's, (&'static mut ElevatorState, &'static mut ElevatorLogic)>;
+
 type EquipmentQuery<'w, 's> = Query<
     'w,
     's,
@@ -100,7 +104,7 @@ pub fn ui_system(
     (robots, palletizers): (Query<&RobotState>, Query<&PalletizerState>),
     mesas: Query<&MesaLogic>,
     cars: Query<(&ShuttleState, &ShuttleLogic)>,
-    mut placers: Query<(&mut PaperPlacerState, &PaperPlacerLogic)>,
+    (mut placers, mut elevators): (PlacerQuery, ElevatorQuery),
     mut commands: Commands,
 ) {
     let Ok(ctx) = contexts.ctx_mut() else { return };
@@ -236,6 +240,7 @@ pub fn ui_system(
                 &mut equipment,
                 &robots,
                 &mut placers,
+                &mut elevators,
                 &palletizers,
                 &mesas,
                 &cars,
@@ -301,7 +306,8 @@ fn properties_tab(
     requests: &mut EditRequests,
     equipment: &mut EquipmentQuery,
     robots: &Query<&RobotState>,
-    placers: &mut Query<(&mut PaperPlacerState, &PaperPlacerLogic)>,
+    placers: &mut PlacerQuery,
+    elevators: &mut ElevatorQuery,
     palletizers: &Query<&PalletizerState>,
     mesas: &Query<&MesaLogic>,
     cars: &Query<(&ShuttleState, &ShuttleLogic)>,
@@ -415,10 +421,10 @@ fn properties_tab(
             }
             EquipmentKind::Robot => {
                 ui.label("Coletar de");
-                name_combo(ui, "pick_from", &mut p.pick_from, &conveyor_names, "(mais próximo)");
+                names_select(ui, "pick_from", &mut p.pick_from, &conveyor_names, "(todas ao alcance)");
                 ui.end_row();
                 ui.label("Paletizar em");
-                name_combo(ui, "place_on", &mut p.place_on, &station_names, "(mais próximo)");
+                names_select(ui, "place_on", &mut p.place_on, &station_names, "(todos ao alcance)");
                 ui.end_row();
                 ui.label("Override de velocidade");
                 ui.add(egui::Slider::new(&mut p.speed_override, 0.05..=1.0));
@@ -534,6 +540,26 @@ fn properties_tab(
                     .on_hover_text("Segura o pallet sob a entrega e aplica o papelão. Entradas lidas do CLP têm prioridade.");
                 ui.end_row();
             }
+            EquipmentKind::PalletElevator => {
+                row(ui, "Altura do TDP (topo)", &mut p.height, 0.1..=2.0, " m");
+                row(ui, "Quadro: comprimento", &mut p.length, 0.8..=3.0, " m");
+                row(ui, "Quadro: largura", &mut p.width, 0.8..=3.0, " m");
+                row(ui, "Pallet: comprimento", &mut p.pallet_size[0], 0.6..=1.6, " m");
+                row(ui, "Pallet: altura", &mut p.pallet_size[1], 0.08..=0.3, " m");
+                row(ui, "Pallet: largura", &mut p.pallet_size[2], 0.6..=1.6, " m");
+                ui.label("Pallets na pilha cheia");
+                ui.add(egui::DragValue::new(&mut p.stack_size).range(1..=MAX_STACK));
+                ui.end_row();
+                ui.label("Abastecer automaticamente");
+                ui.checkbox(&mut p.auto_refill, "nova pilha quando acabar")
+                    .on_hover_text("Quando o último pallet sai e o elevador espera vazio embaixo, uma pilha cheia é colocada no TDP após 3 s.");
+                ui.end_row();
+                ui.label("Lógica interna");
+                ui.checkbox(&mut p.auto_logic, "FB do elevador sem CLP").on_hover_text(
+                    "Desce a pilha, solta o pallet de baixo no TDP e levanta o resto. TDPProntoReceber vem do TDP sob o elevador. Entradas lidas do CLP têm prioridade.",
+                );
+                ui.end_row();
+            }
             EquipmentKind::Sensor => {
                 row(ui, "Comprimento do feixe", &mut p.width, 0.1..=5.0, " m");
                 row(ui, "Altura do feixe", &mut p.height, 0.05..=3.0, " m");
@@ -544,7 +570,9 @@ fn properties_tab(
         || before.width != eq.params.width
         || before.height != eq.params.height
         || (kind.is_mesa() && before.box_size != eq.params.box_size)
-        || (kind == EquipmentKind::CardboardPlacer && before.pallet_size != eq.params.pallet_size);
+        || (kind == EquipmentKind::CardboardPlacer && before.pallet_size != eq.params.pallet_size)
+        || (kind == EquipmentKind::PalletElevator
+            && (before.pallet_size != eq.params.pallet_size || before.stack_size != eq.params.stack_size));
     if geometry_changed {
         commands.entity(entity).insert(NeedsRebuild);
     }
@@ -561,6 +589,48 @@ fn properties_tab(
                     robot.pose.r,
                     robot.pose.y
                 ));
+                // Axes against the data sheet limits and speeds.
+                let axes = robot.pose.axes();
+                egui::Grid::new("robot_axes").striped(true).show(ui, |ui| {
+                    for h in ["Eixo", "Posição", "Faixa", "Velocidade", "Máx."] {
+                        ui.strong(h);
+                    }
+                    ui.end_row();
+                    for i in 0..4 {
+                        let (lo, hi) = (spec::MIN[i].to_degrees(), spec::MAX[i].to_degrees());
+                        let pos = axes.0[i].to_degrees();
+                        let speed = robot.axis_speed[i].abs().to_degrees();
+                        let max = spec::SPEED[i].to_degrees();
+                        ui.label(format!("J{}", i + 1));
+                        let text = format!("{pos:.1}°");
+                        if pos - lo < 3.0 || hi - pos < 3.0 {
+                            ui.colored_label(egui::Color32::from_rgb(230, 150, 40), text).on_hover_text("Perto do limite");
+                        } else {
+                            ui.label(text);
+                        }
+                        ui.weak(format!("{lo:.0}° … {hi:.0}°"));
+                        ui.label(format!("{speed:.0}°/s ({:.0}%)", 100.0 * speed / max));
+                        ui.weak(format!("{max:.0}°/s"));
+                        ui.end_row();
+                    }
+                });
+                ui.collapsing("Folha de dados M-410iC/185", |ui| {
+                    ui.label(format!(
+                        "Carga {:.0} kg · alcance {:.0} mm · repetibilidade ±{} mm · massa {:.0} kg",
+                        spec::PAYLOAD_KG,
+                        spec::REACH * 1000.0,
+                        spec::REPEATABILITY_MM,
+                        spec::MASS_KG
+                    ));
+                    ui.label(format!(
+                        "Centro do flange: de {:.0} a {:.0} mm de altura · raio mínimo {:.0} mm no piso · interferência traseira R{:.0}",
+                        spec::MIN_HEIGHT * 1000.0,
+                        spec::MAX_HEIGHT * 1000.0,
+                        spec::MIN_RADIUS * 1000.0,
+                        spec::REAR_RADIUS * 1000.0
+                    ));
+                    ui.weak("Movimentos como nas rotinas TP: transferências em J 100 % e subidas/descidas em L (PICK 3000/1800 mm/s, PLACE 2000/4000 mm/s), rampa de aceleração de 0,35 s, tudo multiplicado pelo override.");
+                });
             }
         }
         EquipmentKind::CardboardPlacer => {
@@ -580,6 +650,47 @@ fn properties_tab(
                 if ui.button("Reabastecer depósito (100)").clicked() {
                     cp.sheets_left = 100;
                 }
+            }
+        }
+        EquipmentKind::PalletElevator => {
+            if let Ok((mut elevator, mut logic)) = elevators.get_mut(entity) {
+                ui.separator();
+                let garra = if elevator.clamp >= 0.98 {
+                    "fechada"
+                } else if elevator.clamp <= 0.02 {
+                    "aberta"
+                } else {
+                    "em movimento"
+                };
+                ui.label(format!(
+                    "Passo {} · pallets na pilha: {} · garra {garra} a {:.0} mm",
+                    logic.passo,
+                    elevator.count,
+                    elevator.z * 1000.0
+                ));
+                ui.label(format!("FimDoCiclo {}", u8::from(logic.fim_do_ciclo)));
+                let red = egui::Color32::from_rgb(230, 70, 60);
+                for (on, text) in [
+                    (logic.luz_sem_pallet, "SEM PALLET NA PILHA"),
+                    (logic.falha_sensor_central, "Falha: sensor intermediário não detectado"),
+                    (logic.falha_abre_fecha, "Falha: tempo de abrir/fechar a garra"),
+                    (logic.falha_sobe_desce, "Falha: tempo de subir/descer"),
+                ] {
+                    if on {
+                        ui.colored_label(red, text);
+                    }
+                }
+                ui.horizontal(|ui| {
+                    let full = eq.params.stack_size.min(MAX_STACK);
+                    if ui.button(format!("Reabastecer pilha ({full})")).clicked() {
+                        // A new stack is set on the TDP, or hangs from closed clamps.
+                        elevator.resting = elevator.clamp < 0.98;
+                        elevator.count = full;
+                    }
+                    if ui.button("Reiniciar (CmdReiniciar)").clicked() {
+                        logic.reiniciar = true;
+                    }
+                });
             }
         }
         EquipmentKind::ShuttleCar => {
@@ -676,15 +787,24 @@ fn direction_hint(dir: SignalDir) -> &'static str {
     }
 }
 
-fn name_combo(ui: &mut egui::Ui, id: &str, value: &mut String, options: &[String], empty_label: &str) {
-    egui::ComboBox::from_id_salt(id)
-        .selected_text(if value.is_empty() { empty_label.to_owned() } else { value.clone() })
-        .show_ui(ui, |ui| {
-            ui.selectable_value(value, String::new(), empty_label);
-            for name in options {
-                ui.selectable_value(value, name.clone(), name);
+/// Several equipment names; none selected means every one.
+fn names_select(ui: &mut egui::Ui, id: &str, value: &mut Vec<String>, options: &[String], empty_label: &str) {
+    let text = if value.is_empty() { empty_label.to_owned() } else { value.join(", ") };
+    egui::ComboBox::from_id_salt(id).selected_text(text).show_ui(ui, |ui| {
+        if ui.selectable_label(value.is_empty(), empty_label).clicked() {
+            value.clear();
+        }
+        for name in options {
+            let mut on = value.contains(name);
+            if ui.checkbox(&mut on, name).changed() {
+                if on {
+                    value.push(name.clone());
+                } else {
+                    value.retain(|n| n != name);
+                }
             }
-        });
+        }
+    });
 }
 
 fn tag_cache_key(project: &ProjectState) -> Vec<(String, usize, Option<u32>)> {
@@ -737,7 +857,8 @@ fn tag_combo(ui: &mut egui::Ui, id: &str, chosen: &mut Option<String>, tags: &[(
 fn auto_driven(eq: &Equipment, key: &str) -> bool {
     let actuator = match eq.kind {
         EquipmentKind::PalletizingConveyor => matches!(key, "motor" | "stop"),
-        k if k.is_mesa() || k == EquipmentKind::ShuttleCar || k == EquipmentKind::CardboardPlacer => eq.kind.signals().iter().any(|s| s.key == key && s.dir == SignalDir::In),
+        k if k.is_mesa()
+            || matches!(k, EquipmentKind::ShuttleCar | EquipmentKind::CardboardPlacer | EquipmentKind::PalletElevator) => eq.kind.signals().iter().any(|s| s.key == key && s.dir == SignalDir::In),
         _ => false,
     };
     actuator && eq.params.auto_logic

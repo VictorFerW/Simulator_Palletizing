@@ -227,6 +227,7 @@ pub fn build_visual(
         }
         EquipmentKind::Robot => robot_visual(parent, meshes, palette),
         EquipmentKind::CardboardPlacer => paper_visual(parent, meshes, palette, &p),
+        EquipmentKind::PalletElevator => elevator_visual(parent, meshes, palette, &p),
         EquipmentKind::ShuttleCar => {
             // Rail, cable chain and the distance sensor at the rail start.
             let rail = meshes.add(Cuboid::new(p.length, 0.05, 0.07));
@@ -668,6 +669,95 @@ fn tdp_visual(parent: &mut ChildSpawnerCommands, meshes: &mut Assets<Mesh>, pale
         MeshMaterial3d(palette.dark.clone()),
         Transform::from_xyz(-length / 2.0 + 0.45, height - 0.3, -width / 2.0 + 0.25),
     ));
+}
+
+/// Elevador de pallets: four columns around the TDP, top rails and the drive
+/// beam, the clamp bars with their forks and the stack of empty pallets.
+fn elevator_visual(parent: &mut ChildSpawnerCommands, meshes: &mut Assets<Mesh>, palette: &Palette, p: &crate::model::Params) {
+    use crate::elevator::{ElevatorClamp, ElevatorPallet, MAX_STACK, levels};
+    let top = p.height + 2.0;
+    let (hx, hz) = (p.length / 2.0, p.width / 2.0);
+    let post = meshes.add(Cuboid::new(0.12, top, 0.12));
+    for x in [-hx, hx] {
+        for z in [-hz, hz] {
+            parent.spawn((
+                Mesh3d(post.clone()),
+                MeshMaterial3d(palette.frame_grey.clone()),
+                Transform::from_xyz(x, top / 2.0, z),
+            ));
+        }
+    }
+    let rail = meshes.add(Cuboid::new(p.length + 0.12, 0.14, 0.12));
+    for z in [-hz, hz] {
+        parent.spawn((
+            Mesh3d(rail.clone()),
+            MeshMaterial3d(palette.frame_grey.clone()),
+            Transform::from_xyz(0.0, top - 0.07, z),
+        ));
+    }
+    // Drive beam (yellow) with the motor-reducer, at the back.
+    parent.spawn((
+        Mesh3d(meshes.add(Cuboid::new(0.16, 0.28, p.width + 0.12))),
+        MeshMaterial3d(palette.fanuc_yellow.clone()),
+        Transform::from_xyz(-hx, top - 0.14, 0.0),
+    ));
+    parent.spawn((
+        Mesh3d(meshes.add(Cuboid::new(0.3, 0.3, 0.35))),
+        MeshMaterial3d(palette.dark.clone()),
+        Transform::from_xyz(-hx, top + 0.15, 0.25),
+    ));
+    // Vertical guides on the side columns.
+    let guide = meshes.add(Cuboid::new(0.05, top - p.height, 0.05));
+    for z in [-hz, hz] {
+        parent.spawn((
+            Mesh3d(guide.clone()),
+            MeshMaterial3d(palette.steel.clone()),
+            Transform::from_xyz(0.0, (top + p.height) / 2.0, z * 0.97),
+        ));
+    }
+    // Clamp bars: the bar outside, two forks entering the pallet side openings.
+    let (px, pz) = (p.pallet_size[0], p.pallet_size[2]);
+    let bar = meshes.add(Cuboid::new(px * 0.9, 0.12, 0.06));
+    let fork = meshes.add(Cuboid::new(0.16, 0.06, 0.14));
+    let arm = meshes.add(Cuboid::new(0.08, 0.08, hz - pz / 2.0));
+    let z0 = levels(p)[2];
+    for side in [-1.0f32, 1.0] {
+        parent
+            .spawn((
+                Transform::from_xyz(0.0, p.height + z0 + p.pallet_size[1] / 2.0, side * (pz / 2.0 + 0.05)),
+                Visibility::default(),
+                ElevatorClamp(side),
+            ))
+            .with_children(|clamp| {
+                clamp.spawn((
+                    Mesh3d(bar.clone()),
+                    MeshMaterial3d(palette.dark.clone()),
+                    Transform::from_xyz(0.0, 0.0, side * 0.03),
+                ));
+                for x in [-1.0, 1.0] {
+                    clamp.spawn((
+                        Mesh3d(fork.clone()),
+                        MeshMaterial3d(palette.fanuc_yellow.clone()),
+                        Transform::from_xyz(x * px * 0.27, -0.01, -side * 0.06),
+                    ));
+                }
+                // Arm to the carriage on the guide.
+                clamp.spawn((
+                    Mesh3d(arm.clone()),
+                    MeshMaterial3d(palette.frame_grey.clone()),
+                    Transform::from_xyz(0.0, 0.0, side * (0.06 + (hz - pz / 2.0) / 2.0)),
+                ));
+            });
+    }
+    for i in 0..p.stack_size.min(MAX_STACK) {
+        parent
+            .spawn((
+                Transform::from_xyz(0.0, p.height + i as f32 * p.pallet_size[1], 0.0),
+                Visibility::default(),
+                ElevatorPallet(i),
+            ))
+            .with_children(|pallet| pallet_mesh(pallet, meshes, palette, px, pz));
+    }
 }
 
 /// Wooden pallet with its bottom at local y = 0; `length` along X, `width` along Z.

@@ -26,10 +26,13 @@ pub enum EquipmentKind {
     ShuttleCar,
     /// Colocador de papelão (CP): lays cardboard sheets on pallets.
     CardboardPlacer,
+    /// Elevador de pallets (alimentador): keeps a stack of empty pallets lifted
+    /// over a TDP and releases the bottom one at a time.
+    PalletElevator,
 }
 
 impl EquipmentKind {
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 13] = [
         Self::BeltConveyor,
         Self::Table2Stage,
         Self::Table3Stage,
@@ -37,6 +40,7 @@ impl EquipmentKind {
         Self::PalletizingConveyor,
         Self::ShuttleCar,
         Self::CardboardPlacer,
+        Self::PalletElevator,
         Self::Robot,
         Self::BoxEmitter,
         Self::PalletDispenser,
@@ -58,6 +62,7 @@ impl EquipmentKind {
             Self::Sensor => "Sensor fotoelétrico",
             Self::ShuttleCar => "Carro de pallet vazio (CVZ)",
             Self::CardboardPlacer => "Colocador de papelão (CP)",
+            Self::PalletElevator => "Elevador de pallets (alimentador)",
         }
     }
 
@@ -75,6 +80,7 @@ impl EquipmentKind {
             Self::Sensor => "Sensor",
             Self::ShuttleCar => "CVZ",
             Self::CardboardPlacer => "CP",
+            Self::PalletElevator => "Elevador",
         }
     }
 
@@ -116,6 +122,7 @@ impl EquipmentKind {
             Self::Sensor => SENSOR_SIGNALS,
             Self::ShuttleCar => SHUTTLE_SIGNALS,
             Self::CardboardPlacer => PAPER_SIGNALS,
+            Self::PalletElevator => ELEVATOR_SIGNALS,
         }
     }
 }
@@ -217,6 +224,24 @@ const PAPER_SIGNALS: &[SignalDef] = &[
     SignalDef::new("SensorPapelaoSuperior", "Sensor papelão superior", Out, Bool),
     SignalDef::new("SensorTDP", "Pallet sob a entrega", Out, Bool),
 ];
+// FB do elevador / alimentador de pallets.
+const ELEVATOR_SIGNALS: &[SignalDef] = &[
+    SignalDef::new("MotorSobe", "Motor subir", In, Bool),
+    SignalDef::new("MotorDesce", "Motor descer", In, Bool),
+    SignalDef::new("Garra_Abrir", "Garra abrir", In, Bool),
+    SignalDef::new("Garra_Fechar", "Garra fechar", In, Bool),
+    SignalDef::new("TDPProntoReceber", "TDP pronto p/ receber", In, Bool),
+    SignalDef::new("TDPosteriorProntoReceber", "TDP posterior pronto p/ receber", In, Bool),
+    SignalDef::new("SensorPosInferior", "Sensor posição inferior", Out, Bool),
+    SignalDef::new("SensorPosInferiorMec", "Fim de curso inferior", Out, Bool),
+    SignalDef::new("SensorPosIntermediario", "Sensor posição intermediária", Out, Bool),
+    SignalDef::new("SensorPosSuperior", "Sensor posição superior", Out, Bool),
+    SignalDef::new("SensorPosSuperiorMec", "Fim de curso superior", Out, Bool),
+    SignalDef::new("SensorGarraAberta", "Garra aberta", Out, Bool),
+    SignalDef::new("SensorGarraFechada", "Garra fechada", Out, Bool),
+    SignalDef::new("SensorPilhaPallet", "Pallet na pilha", Out, Bool),
+    SignalDef::new("SensorTDP", "Pallet no TDP", Out, Bool),
+];
 // FB "CVZ" (carro vazio): inverter, brake, distance sensor, TDP on board.
 const SHUTTLE_SIGNALS: &[SignalDef] = &[
     SignalDef::new("LigarDrive", "Ligar inversor", In, Bool),
@@ -284,10 +309,12 @@ pub struct Params {
     /// actuators that are not driven by the PLC.
     #[serde(alias = "auto_change")]
     pub auto_logic: bool,
-    /// Robot: name of the conveyor to pick from (empty = nearest in reach).
-    pub pick_from: String,
-    /// Robot: name of the palletizing TDP to place on (empty = nearest in reach).
-    pub place_on: String,
+    /// Robot: mesas/belts to pick from (empty = every one in reach).
+    #[serde(deserialize_with = "names")]
+    pub pick_from: Vec<String>,
+    /// Robot: palletizing TDPs to place on (empty = every one in reach).
+    #[serde(deserialize_with = "names")]
+    pub place_on: Vec<String>,
     /// Robot speed override 0.1..=1.0.
     pub speed_override: f32,
     /// CVZ: TDP on the car, length along its transport (across the rail).
@@ -306,6 +333,25 @@ pub struct Params {
     pub apply_paper: bool,
     /// CP: two sheets per pallet (Aplicar2xPapelao).
     pub cp_two_sheets: bool,
+    /// Elevador: pallets in a full stack.
+    pub stack_size: u32,
+    /// Elevador: a new stack is set on the TDP when the last pallet leaves.
+    pub auto_refill: bool,
+}
+
+/// A list of equipment names; older layouts stored a single name (empty = none).
+fn names<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(String),
+        Many(Vec<String>),
+    }
+    Ok(match OneOrMany::deserialize(d)? {
+        OneOrMany::One(s) if s.is_empty() => Vec::new(),
+        OneOrMany::One(s) => vec![s],
+        OneOrMany::Many(v) => v,
+    })
 }
 
 impl Default for Params {
@@ -321,8 +367,8 @@ impl Default for Params {
             layers: 5,
             interlock: true,
             auto_logic: true,
-            pick_from: String::new(),
-            place_on: String::new(),
+            pick_from: Vec::new(),
+            place_on: Vec::new(),
             speed_override: 1.0,
             car_length: 1.56,
             car_width: 1.28,
@@ -332,6 +378,8 @@ impl Default for Params {
             cp_stroke: 1.05,
             apply_paper: true,
             cp_two_sheets: false,
+            stack_size: 10,
+            auto_refill: true,
         }
     }
 }
@@ -367,6 +415,8 @@ impl Params {
             EquipmentKind::ShuttleCar => Self { length: 8.0, width: 1.56, height: 0.5, speed: 0.25, ..base },
             // CP C2370: 1887 mm between the deposit and the delivery position.
             EquipmentKind::CardboardPlacer => Self { length: 1.887, width: 1.6, height: 0.0, ..base },
+            // Over a TDP: frame around the pallet, `height` = TDP top.
+            EquipmentKind::PalletElevator => Self { length: 1.3, width: 1.75, height: 0.5, ..base },
             // Sensor: `width` = beam length, `height` = beam height above floor.
             EquipmentKind::Sensor => Self { length: 0.1, width: 1.0, height: 1.02, ..base },
         }
@@ -396,6 +446,10 @@ impl Equipment {
             EquipmentKind::CardboardPlacer => (
                 Vec3::new(-p.length / 2.0 - 0.75, 0.0, -0.8),
                 Vec3::new(p.length / 2.0 + 1.0, 2.35, 0.8),
+            ),
+            EquipmentKind::PalletElevator => (
+                Vec3::new(-p.length / 2.0 - 0.06, 0.0, -p.width / 2.0 - 0.06),
+                Vec3::new(p.length / 2.0 + 0.06, p.height + 2.1, p.width / 2.0 + 0.06),
             ),
             EquipmentKind::ShuttleCar => (
                 Vec3::new(-p.length / 2.0, 0.0, -p.car_length / 2.0 - 0.1),
