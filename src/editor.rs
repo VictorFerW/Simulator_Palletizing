@@ -78,6 +78,9 @@ pub fn spawn_equipment(
         EquipmentKind::ShuttleCar => {
             root.insert((ConveyorState::default(), ShuttleState::default(), ShuttleLogic::default()));
         }
+        EquipmentKind::FullCar => {
+            root.insert((ConveyorState::default(), ShuttleState::default(), crate::fullcar::FullCarLogic::default()));
+        }
         EquipmentKind::CardboardPlacer => {
             root.insert((crate::paper::PaperPlacerState::default(), crate::paper::PaperPlacerLogic::default()));
         }
@@ -549,8 +552,9 @@ pub fn draw_gizmos(
                 // One arrow per driven stage: green running, grey stopped.
                 let p = &eq.params;
                 let layout = conveyor::layout(eq);
-                let surface = conveyor::surface(eq, tf, car.map(|c| c.x));
-                let sign = if io.get_bool("reverse") || io.get_bool("Reverso_TDP") { -1.0 } else { 1.0 };
+                let surface = conveyor::surface(eq, tf, car);
+                let reverse = io.get_bool("reverse") || io.get_bool("Reverso_TDP") || io.get("VelocidadeTDP") < 0.0;
+                let sign = if reverse { -1.0 } else { 1.0 };
                 if let Some(car) = car {
                     // Laser of the distance sensor to the car.
                     let y = 0.25;

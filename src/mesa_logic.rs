@@ -3,9 +3,11 @@
 //! pré-formadora) and "Mesa Antecipada Coleta" (common to both).
 //!
 //! Step numbers, timers and flags keep the names of the original code so the
-//! behaviour can be compared side by side. Only the automatic mode is ported,
-//! for normal layers: last odd layer, 10x1 and 10 kg variants are off
-//! (`Ultima_Camada_Impar = 0`, `Produto_10x1 = 0`, `Fardo10Kg = 0`).
+//! behaviour can be compared side by side. Only the automatic mode is ported.
+//! Última camada ímpar (mesa 2 estágios): when the robot asks for a single fardo
+//! (`single_request`, the last product of a pallet) only one enters, the empurrador
+//! pushes it and the roletada releases it to the coleta, which then waits for the
+//! pushed side only. 10x1 and 10 kg variants are off (`Produto_10x1 = 0`, `Fardo10Kg = 0`).
 //! Actuators driven by a connected PLC always win over this logic.
 
 use bevy::prelude::*;
@@ -57,6 +59,8 @@ pub struct Coleta {
     t_recebimento: Ton,
     t_retirada: Ton,
     t_liberar: Ton,
+    /// A single fardo (pushed side) is on its way / on the coleta.
+    pub single: bool,
 }
 
 impl Coleta {
@@ -91,7 +95,7 @@ impl Coleta {
                 // Recebido
                 self.motor = true;
                 self.pronto_receber = true;
-                if c1 && c2 {
+                if (c1 || self.single) && c2 {
                     self.trig_recebimento = true;
                 }
                 if q_rec {
@@ -106,7 +110,7 @@ impl Coleta {
                 // Recolhe batente e libera coleta
                 self.motor = false;
                 self.pronto_coleta = true;
-                if c1 && c2 {
+                if (c1 || self.single) && c2 {
                     self.trig_liberar = true;
                 }
                 if q_lib {
@@ -128,6 +132,7 @@ impl Coleta {
                 }
                 if q_ret {
                     self.batente = true;
+                    self.single = false;
                     self.passo = 1;
                     self.pronto_coleta = false;
                     self.autoriza_pick = false;
@@ -164,6 +169,10 @@ pub struct Roletada2 {
     t_entrada_etapa2: Ton,
     t_simultaneidade: Ton,
     t_cilindro_coleta: Ton,
+    /// Ultima_Camada_Impar: the next group is a single fardo.
+    ultima_impar: bool,
+    /// The fardo being transferred to the coleta is a single one.
+    pub single_sent: bool,
 }
 
 struct Sensors2 {
@@ -273,6 +282,10 @@ impl Roletada2 {
                     };
                 }
             }
+            10 if self.ultima_impar && !self.entrada_transferindo && !s.pos1 && (s.pos2 || s.pos3) => {
+                // Última camada ímpar: no second fardo, release the pushed one.
+                self.passo_roletada = 4;
+            }
             1 | 10 | 21 => {
                 // Recebe fardo (1: primeiro, 10: segundo, 21: última camada)
                 self.empurrador_av = false;
@@ -313,7 +326,9 @@ impl Roletada2 {
                 self.empurrador_av = false;
                 self.empurrador_rc = true;
                 if s.emp_rc {
-                    if s.coleta1 && !s.coleta2 {
+                    if self.ultima_impar && !s.pos1 && (s.pos2 || s.pos3) {
+                        self.passo_roletada = 50; // Última camada ímpar: só o fardo empurrado
+                    } else if s.coleta1 && !s.coleta2 {
                         self.passo_roletada = 20;
                     } else if !s.pos1 {
                         self.passo_roletada = 10; // Modo padrão
@@ -380,6 +395,7 @@ impl Roletada2 {
                     self.antecipada_transferindo = true;
                     self.motor_roletada = true;
                     self.bloqueio_coleta = false;
+                    self.single_sent = self.ultima_impar && !s.pos1;
                     self.passo_roletada = 51;
                     self.flag_preparo_especial = false;
                 }
@@ -388,7 +404,7 @@ impl Roletada2 {
                 // Transferência - verifica simultaneidade/bloqueio
                 self.trig_simultaneidade = true;
                 self.motor_roletada = true;
-                self.trig_cilindro_coleta = s.coleta1 && s.coleta2;
+                self.trig_cilindro_coleta = (s.coleta1 || self.single_sent) && s.coleta2;
                 if q_cilindro {
                     self.bloqueio_coleta = true;
                 }
@@ -751,6 +767,8 @@ pub struct MesaLogic {
     pub coleta: Coleta,
     /// Set by the robot after lifting the fardos (Robo_Fardos_Coletados).
     pub robot_collected: bool,
+    /// Set by the robot when the pallet needs one last product (última camada ímpar).
+    pub single_request: bool,
 }
 
 impl MesaLogic {
@@ -760,7 +778,7 @@ impl MesaLogic {
             EquipmentKind::Table3Stage => MesaProgram::PreForma(PreForma3::default()),
             _ => return None,
         };
-        Some(Self { program, coleta: Coleta::default(), robot_collected: false })
+        Some(Self { program, coleta: Coleta::default(), robot_collected: false, single_request: false })
     }
 
     pub fn status(&self) -> String {
@@ -810,7 +828,12 @@ pub fn run_mesas(time: Res<Time>, control: Res<SimControl>, mut mesas: Query<(&E
                     coleta1: c1,
                     coleta2: c2,
                 };
+                r.ultima_impar = logic.single_request;
                 r.tick(&s, pronto, recebido, dt);
+                if r.single_sent {
+                    logic.single_request = false;
+                    logic.coleta.single = true;
+                }
                 drive(&mut io, "Motor", r.motor);
                 drive(&mut io, "Bloqueio_Entrada", r.bloqueio_entrada);
                 drive(&mut io, "Bloqueio_Coleta", r.bloqueio_coleta);

@@ -25,6 +25,9 @@ pub struct ShuttleState {
     pub loaded: bool,
     /// The pallet on board was released by a colocador de papelão.
     pub cargo_papered: bool,
+    /// CCH: TDP rotation from the receiving orientation (rad) and its speed.
+    pub giro: f32,
+    pub giro_v: f32,
 }
 
 /// Child entity carrying the car meshes (moved along the rail).
@@ -216,7 +219,7 @@ pub fn shuttle_motion(
         let dx = state.x - old_x;
 
         // Loads resting on the car TDP travel with it.
-        let surface = conveyor::surface(eq, tf, Some(state.x));
+        let surface = conveyor::surface(eq, tf, Some(&*state));
         let inverse = surface.transform.compute_affine().inverse();
         let shift = tf.rotation * Vec3::X * dx;
         let mut loaded = false;

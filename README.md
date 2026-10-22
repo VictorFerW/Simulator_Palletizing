@@ -23,6 +23,7 @@ Na primeira execução, o programa abre uma célula padrão que já funciona sem
 | TDP de paletização | TDP + batente de posicionamento | Segura o pallet no batente enquanto o robô paletiza. Com **lógica interna** ligada, traz o pallet vazio, segura e libera quando completa; o que vier do CLP tem prioridade |
 | Magazine de pallets | — | Coloca pallets vazios (PBR 1000 × 1200) sobre o TDP |
 | Removedor | — | Remove caixas e pallets (com a carga) que param na sua área |
+| Carro cheio giratório (CCH) | Selgron "MOD CARRO ALIMENT ROTATIVO" + FBs "Carro Cheio Movimento" e "Carro Cheio TDP" | Carro sobre trilho com TDP redondo (Ø2054, rolos 1829 × 1380 a 514 mm) num rolamento de giro. Busca os pallets completos nas linhas e entrega girados |
 | Elevador de pallets (alimentador) | Selgron "MOD ALIMENTADOR DE PALETE" + FB do elevador | Quadro de quatro colunas sobre um TDP, com garras laterais num carro vertical e a pilha de pallets vazios. Solta um pallet por vez no TDP |
 | Colocador de papelão (CP) | Selgron "MOD COLOCADOR PAPELAO C2370" + FB "CP" | Pórtico com carro entre o depósito de papelão e a entrega (1887 mm), cilindro vertical e cabeça de ventosas. Pode ficar sobre um TDP normal ou sobre uma parada do CVZ |
 | Carro de pallet vazio (CVZ) | FB "CVZ" | Carro sobre trilho com TDP que transporta perpendicular ao trilho; o pallet anda com o carro. Inversor (`LigarDrive`, `LiberarFreio`, `Velocidade` em mm/s) e sensor de distância (`PosicaoAtual` em mm) |
@@ -75,6 +76,8 @@ A divisão das faixas de J2 e J3, que a folha de dados dá só como total, foi e
 
 Os movimentos seguem as rotinas TP. As transferências são **J** (interpolação por eixos): a duração vem do eixo mais lento na sua velocidade máxima. As subidas e descidas são **L** (reta) nas velocidades das rotinas: PICK desce a 3000 mm/s e sobe a 1800 mm/s; PLACE desce a 2000 mm/s e sobe a 4000 mm/s, limitadas pelas velocidades dos eixos. Todos usam perfil trapezoidal com rampa de 0,35 s e são multiplicados pelo override (`OVERRIDE=R[104]`). O J1 não passa de ±180°: se a mesa e o pallet estiverem dos dois lados dessa emenda, o robô dá a volta longa, como o real. Por isso, gire a base do robô para que o 0° do J1 aponte para a área de trabalho (na célula padrão, −135°). O painel do robô mostra a posição e a velocidade de cada eixo contra os limites. Com o robô selecionado, o editor desenha o alcance, o raio interno, a interferência traseira e o contorno do espaço de trabalho no plano do braço.
 
+A altura de segurança das transferências (coleta/pallet + 0,35 m) e o perch são limitados pela altura máxima que o braço alcança naquele raio. Perto do topo do envelope essa altura cai: com o cabeçote (435 mm até o quadro mais 295 mm de pinça), a base dos fardos chega a ~1,65 m em 2,1 m de raio e ~1,18 m em 2,9 m. Se não houver folga para passar sobre a coleta ou o pallet, o robô para com "Altura máxima do robô" em vez de esticar o braço além dos limites.
+
 A geometria do braço vem do modelo STEP do fabricante. Ele divide os mesmos 1945 mm um pouco diferente da folha de dados: 394/1306/244 mm contra 390/1300/255 mm.
 
 ### Várias mesas, vários TDPs e vários robôs
@@ -87,7 +90,7 @@ Vários robôs podem dividir mesas e TDPs. Cada robô reserva a mesa do planejam
 
 Como na rotina MOVE_PERCH, quando não há ciclo para começar o robô vai para a posição de espera em cima da coleta da próxima mesa, na altura de infeed (topo da mesa + fardo + 0,35 m), com o cabeçote alinhado à mesa, e espera ali o Autoriza_Pick ou o pallet.
 
-O robô usa o cabeçote Selgron "MOD CAB 4 FARDOS" (0323P01-010000): quadro de 1234 × 500 mm com acoplamento 435 mm acima da base (o TCP fica na base do quadro, onde o topo dos fardos encosta), divisória central de 229 mm e duas pinças laterais de 295 mm acionadas pelos cilindros CIL 40-420. As pinças fecham sobre o grupo coletado e abrem ao depositar.
+O robô usa o cabeçote Selgron "MOD CAB 4 FARDOS" (0323P01-010000): quadro de 1234 × 500 mm com acoplamento 435 mm acima da base (os fardos ficam no fundo da garra, entre as pontas das pinças: o TCP é a ponta das pinças, na base dos fardos), divisória central de 229 mm e duas pinças laterais de 295 mm acionadas pelos cilindros CIL 40-420. As pinças fecham sobre o grupo coletado e abrem ao depositar.
 
 ## Colocador de papelão (CP)
 
@@ -97,6 +100,48 @@ O carro do CP corre entre a posição de **pega**, sobre o depósito com a pilha
 - **Como parada do CVZ:** marque a caixa **CP** numa das paradas do carro. Depois de receber o pallet na coleta, o carro vai primeiro até essa parada, espera o papelão e só então segue para o destino.
 
 Sem CLP, a **lógica interna** porta os passos automáticos do FB CP (0–2, 100–117, 200/201, 400): desce na pilha, liga o vácuo ao perder os dois sensores, para no sensor superior, estabiliza, sobe, confere o sensor inferior (sem papelão → passo 400), vai à entrega, desce até o sensor superior, desliga o vácuo, sobe e volta. A opção **Aplicar 2x papelão** repete a aplicação. O botão **Reabastecer depósito** repõe a pilha. A escolha "aplicar ou não" por ID de linha do FB vem do CLP; internamente vale a opção **Aplicar papelão**.
+
+## Padrões de paletização
+
+O botão **Padrões de paletização** (barra de cima, ou **Escolher padrão…** no TDP de paletização) abre a tela de formatos. Nela você informa:
+
+- **Produto:** comprimento, largura, altura e peso. O botão **usar fardo da mesa** copia o fardo da primeira mesa.
+- **Cabeçote do robô:** produtos na garra (1 ou 2, um em cada pinça), lado a lado ou em linha. Cada posição do formato é um produto.
+- **Pallet:** os mais usados (PBR 1000 × 1200, Europeu 800 × 1200, Industrial 1200 × 1000, Americano 40 × 48", 1100 × 1100, 1100 × 1300, 1140 × 1140) ou personalizado, mais a sobra permitida por lado e a folga entre unidades.
+- **Limites:** altura máxima com o pallet, peso máximo e camadas (0 = o máximo permitido).
+
+A tela gera os formatos mais usados e mostra as camadas ímpares e pares vistas de cima, numeradas na ordem do robô:
+
+- **Coluna:** todas as unidades no mesmo sentido, camadas iguais.
+- **Coluna cruzada:** as camadas pares giradas 90°. Aparece quando o número por camada é o mesmo nos dois sentidos.
+- **Amarração (tijolo):** um bloco no comprimento e outro atravessado, com as camadas pares espelhadas para desencontrar as juntas (por exemplo, os 5 sacos de 600 × 400 em 1200 × 1000).
+- **Catavento (pinwheel):** quatro blocos girando em volta do centro.
+
+No fim da tela, **Produto nos emissores e mesas** lista os emissores de caixas e as mesas da célula com o tamanho atual. Marque os que devem receber o produto informado e clique em **Atualizar tamanho do produto**. Os emissores passam a criar caixas desse tamanho, e as mesas refazem as pistas e o empurrador para o novo fardo. As caixas já criadas continuam com o tamanho antigo.
+
+### Pegas com a garra de dois lados
+
+Ao gerar o formato, a tela calcula a sequência de pegas. As vistas mostram o número da pega em cada posição: o mesmo número nas duas posições de um par, e "a/b" quando a pega deposita um produto de cada vez.
+
+- **Par:** duas posições vizinhas no sentido em que os produtos ficam na garra. O robô deposita os dois juntos e abre as duas pinças.
+- **Dois depósitos simples:** posições que não formam par. O robô abre só a pinça do produto daquela posição, sobe até as pinças e o outro produto passarem acima do que já foi colocado, gira e deposita o outro.
+- **Camada ímpar:** em cada camada vêm primeiro as posições que não formam par, depois os pares. A que sobrar vai junto com o primeiro depósito simples da camada seguinte, e o robô sobe para depositá-lo lá. Com 5 por camada (2 atravessados e 3 no comprimento), a sequência fica: pega 1 = as duas atravessadas, uma de cada vez; pega 2 = o par; pega 3 = a última da camada mais a primeira da camada de cima.
+- **Último produto do pallet:** quando sobra um só, o robô pede à mesa um produto único. Entra só um fardo, o empurrador empurra, a roletada libera para a coleta e o cabeçote pega com a pinça desse lado.
+
+No depósito simples o giro do punho é exato (só voltas inteiras, dentro de ±360° do J4), porque meia volta colocaria o outro produto na posição. As pinças encostam os dois fardos do par um no outro ao fechar. Com `PDT_TRACE`, o simulador informa qual pinça abre em cada depósito e avisa se um fardo da garra encostar num fardo do pallet.
+
+Cada formato mostra unidades por camada, camadas e total, altura e peso (e qual limite parou as camadas), a ocupação da área do pallet, a sobra e se as camadas são amarradas. Para o TDP escolhido, a tela mostra a altura do topo do pallet completo e avisa quando ela passa do alcance do robô com o cabeçote. **Aplicar ao TDP de paletização** grava o formato e as camadas no TDP (e no layout salvo), e o robô passa a seguir a ordem e a orientação do formato. **Usar automático** volta à grade simples.
+
+## Carro cheio giratório (CCH)
+
+Coloque o trilho ao longo das linhas, com os TDPs de paletização descarregando no carro (o TDP do carro fica atravessado no trilho para receber). As paradas são lidas pelo sensor de distância: **Espera** (ID 10), **Entrega** (ID 20) e **Linha A, B...** (IDs 100, 200...). O ângulo **Giro receber → entregar** define para onde o pallet sai na entrega: 90° ao longo do trilho, 180° para o outro lado. O TDP é redondo, com os rolos das pontas cortados no círculo, para girar sem bater nos TDPs vizinhos.
+
+Sem CLP, a lógica interna porta os dois FBs:
+
+- **Movimento:** com uma linha pedindo (`ID_Busca`), vai até ela; com pallet no centro, vai para a entrega; sem nada, vai para a espera (e desiste da espera se surgir um pedido). O posicionamento segue os passos 200–203: velocidade rápida (com pallet ou vazio), redução proporcional, velocidade lenta nos últimos 50 mm, tolerância de 5 mm, freio só com a velocidade zerada.
+- **TDP:** gira para receber, recebe até centralizar (Sensor 3 com Sensor 2 e sem o Sensor 1; o Sensor 4 indica fora do centro), gira para entregar a caminho da entrega, transfere e volta a girar para receber.
+
+`ID_Busca` vem do rastreamento do CLP. Internamente, é a linha que espera há mais tempo com um pallet completo no TDP que descarrega no carro.
 
 ## Elevador de pallets (alimentador)
 
@@ -121,6 +166,7 @@ Sem CLP, a **lógica interna** porta o posicionamento do FB CVZ (passo 201): vel
 | TDP de paletização | Motor ligado, Batente de posicionamento | Pallet em posição, Pallet completo, Caixas no pallet (Int) |
 | FANUC M-410iC/185 | Liberar ciclo, Autoriza_Pick | Em ciclo, Robo_Fardos_Coletados, Pallet completo, Caixas no pallet (Int) |
 | Emissor / Magazine / Removedor | Emitir / Liberar pallet / Remover | — |
+| Carro cheio giratório | Motor, LiberarFreio, Velocidade, MotorTDP, LiberarFreioTDP, VelocidadeTDP, MotorGiro, LiberarFreioGiro, VelocidadeGiro | PosicaoAtual, DriverVelocidade, DriverFalha, FimDeCurso, Sensor1–4, Giro_Sensor_PosReceber, Giro_Sensor_PosEntregar, VelocidadeAtualTDP, VelocidadeAtualGiro |
 | Elevador de pallets | MotorSobe, MotorDesce, Garra_Abrir, Garra_Fechar, TDPProntoReceber, TDPosteriorProntoReceber | SensorPosInferior, SensorPosInferiorMec, SensorPosIntermediario, SensorPosSuperior, SensorPosSuperiorMec, SensorGarraAberta, SensorGarraFechada, SensorPilhaPallet, SensorTDP |
 | Colocador de papelão (CP) | MotorPosicaoColeta, MotorPosicaoEntrega, CilindroAvancar, CilindroRecuar, Vacuo | LimitePega, LimiteEntrega, SensorCilindroAv, SensorCilindroRc, SensorPapelaoInferior, SensorPapelaoSuperior, SensorTDP |
 | Carro de pallet vazio (CVZ) | LigarDrive, LiberarFreio, Velocidade (Int mm/s), Motor_TDP, Reverso_TDP | PosicaoAtual (Int mm), DriverFDBVelocidade (Int mm/s), DriverEmFalha, SensorExtremoAtivoTDP, Sensor_Pallet_Carro |
@@ -171,6 +217,8 @@ src/
   sim.rs             fluxo de caixas, sensores, emissor/removedor, padrão de pallet
   robot.rs           cinemática inversa 4 eixos, programa de paletização, reservas entre robôs
   elevator.rs        elevador/alimentador de pallets e port do FB
+  fullcar.rs         carro cheio giratório (CCH) e port dos FBs de movimento e TDP
+  pattern.rs         padrões de paletização: gerador de formatos e tela
   io.rs              sinais <-> tags (forçado / CLP)
   communication.rs   thread S7: leitura cíclica agrupada e escrita por mudança
   s7.rs              cliente S7comm (COTP, setup, read/write var) e endereços TIA

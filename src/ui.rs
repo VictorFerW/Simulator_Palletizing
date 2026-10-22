@@ -10,6 +10,7 @@ use crate::model::{Equipment, EquipmentKind, Io, NeedsRebuild, Selection, Signal
 use crate::robot::{RobotState, spec, yaw_of};
 use crate::mesa_logic::MesaLogic;
 use crate::elevator::{ElevatorLogic, ElevatorState, MAX_STACK};
+use crate::fullcar::FullCarLogic;
 use crate::paper::{PaperPlacerLogic, PaperPlacerState};
 use crate::shuttle::{ShuttleLogic, ShuttleState};
 use crate::sim::{Load, PalletizerState};
@@ -41,6 +42,8 @@ pub struct UiState {
     tia_filter: String,
     /// Bindable tag list, rebuilt only when the set of active tables/DBs changes.
     tag_cache: TagCache,
+    /// "Padrões de paletização" window.
+    pattern: crate::pattern::PatternUi,
 }
 
 impl Default for UiState {
@@ -53,6 +56,7 @@ impl Default for UiState {
             tag_filter: String::new(),
             tia_filter: String::new(),
             tag_cache: Default::default(),
+            pattern: Default::default(),
         }
     }
 }
@@ -78,6 +82,7 @@ fn default_helper_path() -> String {
     candidates[0].into()
 }
 
+type CarQuery<'w, 's> = Query<'w, 's, (&'static ShuttleState, Option<&'static ShuttleLogic>, Option<&'static FullCarLogic>)>;
 type PlacerQuery<'w, 's> = Query<'w, 's, (&'static mut PaperPlacerState, &'static PaperPlacerLogic)>;
 type ElevatorQuery<'w, 's> = Query<'w, 's, (&'static mut ElevatorState, &'static mut ElevatorLogic)>;
 
@@ -103,7 +108,7 @@ pub fn ui_system(
     mut equipment: EquipmentQuery,
     (robots, palletizers): (Query<&RobotState>, Query<&PalletizerState>),
     mesas: Query<&MesaLogic>,
-    cars: Query<(&ShuttleState, &ShuttleLogic)>,
+    cars: CarQuery,
     (mut placers, mut elevators): (PlacerQuery, ElevatorQuery),
     mut commands: Commands,
 ) {
@@ -144,6 +149,10 @@ pub fn ui_system(
             }
             if ui.button("⟲ Reiniciar").clicked() {
                 control.reset_requested = true;
+            }
+            ui.separator();
+            if ui.button("▦ Padrões de paletização").clicked() {
+                state.pattern.open = true;
             }
             ui.add(egui::Slider::new(&mut control.time_scale, 0.1..=4.0).text("velocidade").logarithmic(true));
             ui.separator();
@@ -251,6 +260,44 @@ pub fn ui_system(
             SideTab::Plc => plc_tab(ui, &mut link, &project),
         });
     });
+    // Padrões de paletização: apply the chosen pattern to the TDP.
+    if !state.pattern.env_checked {
+        state.pattern.env_checked = true;
+        state.pattern.open = std::env::var("PDT_PATTERN").is_ok();
+        state.pattern.auto_apply = std::env::var("PDT_PATTERN").is_ok_and(|v| v == "apply");
+    }
+    if state.pattern.open {
+        let tdps: Vec<(String, f32)> = equipment
+            .iter()
+            .filter(|(_, e, ..)| e.kind == EquipmentKind::PalletizingConveyor)
+            .map(|(_, e, tf, ..)| (e.name.clone(), tf.translation.y + e.params.height))
+            .collect();
+        let mesa_box = equipment.iter().find(|(_, e, ..)| e.kind.is_mesa()).map(|(_, e, ..)| e.params.box_size);
+        let sized: Vec<(String, &str, [f32; 3])> = equipment
+            .iter()
+            .filter(|(_, e, ..)| e.kind == EquipmentKind::BoxEmitter || e.kind.is_mesa())
+            .map(|(_, e, ..)| (e.name.clone(), if e.kind.is_mesa() { "mesa" } else { "emissor" }, e.params.box_size))
+            .collect();
+        if let Some((target, pattern)) = crate::pattern::pattern_window(ctx, &mut state.pattern, &tdps, mesa_box, &sized) {
+            for (_, mut eq, ..) in &mut equipment {
+                if eq.name == target {
+                    eq.params.layers = pattern.layers;
+                    eq.params.pattern = Some(pattern.clone());
+                }
+            }
+        }
+        // Product size on the chosen emitters and mesas (mesas rebuild lanes and empurrador).
+        if let Some((names, size)) = state.pattern.size_request.take() {
+            for (entity, mut eq, ..) in &mut equipment {
+                if names.contains(&eq.name) {
+                    eq.params.box_size = size;
+                    if eq.kind.is_mesa() {
+                        commands.entity(entity).insert(NeedsRebuild);
+                    }
+                }
+            }
+        }
+    }
     if project_fingerprint(&project) != fingerprint_before {
         project.set_changed();
     }
@@ -310,7 +357,7 @@ fn properties_tab(
     elevators: &mut ElevatorQuery,
     palletizers: &Query<&PalletizerState>,
     mesas: &Query<&MesaLogic>,
-    cars: &Query<(&ShuttleState, &ShuttleLogic)>,
+    cars: &CarQuery,
     commands: &mut Commands,
 ) {
     let conveyor_names: Vec<String> = equipment
@@ -393,6 +440,7 @@ fn properties_tab(
 
     let before = eq.params.clone();
     let kind = eq.kind;
+    let tdp_name = eq.name.clone();
     let p = &mut eq.params;
     egui::Grid::new("params").num_columns(2).show(ui, |ui| {
         let row = |ui: &mut egui::Ui, label: &str, value: &mut f32, range: std::ops::RangeInclusive<f32>, suffix: &str| {
@@ -438,9 +486,37 @@ fn properties_tab(
                 ui.label("Camadas");
                 ui.add(egui::DragValue::new(&mut p.layers).range(1..=20));
                 ui.end_row();
-                ui.label("Camadas intertravadas");
-                ui.checkbox(&mut p.interlock, "girar camadas ímpares 90°");
+                ui.label("Padrão de paletização");
+                ui.vertical(|ui| {
+                    match &p.pattern {
+                        Some(chosen) => {
+                            ui.label(format!(
+                                "{} · {} por camada × {}",
+                                chosen.name,
+                                chosen.odd.len(),
+                                p.layers
+                            ));
+                        }
+                        None => {
+                            ui.weak("automático (grade, camadas giradas)");
+                        }
+                    }
+                    ui.horizontal(|ui| {
+                        if ui.button("Escolher padrão…").clicked() {
+                            state.pattern.open = true;
+                            state.pattern.target = tdp_name.clone();
+                        }
+                        if p.pattern.is_some() && ui.button("Usar automático").clicked() {
+                            p.pattern = None;
+                        }
+                    });
+                });
                 ui.end_row();
+                if p.pattern.is_none() {
+                    ui.label("Camadas intertravadas");
+                    ui.checkbox(&mut p.interlock, "girar camadas ímpares 90°");
+                    ui.end_row();
+                }
                 ui.label("Lógica interna");
                 ui.checkbox(&mut p.auto_logic, "motor/batente automáticos sem CLP")
                     .on_hover_text("Traz o pallet vazio, segura no batente enquanto o robô paletiza e libera quando completa. Entradas lidas do CLP têm prioridade.");
@@ -463,6 +539,48 @@ fn properties_tab(
                 row(ui, "Comprimento", &mut p.length, 0.2..=3.0, " m");
                 row(ui, "Largura", &mut p.width, 0.2..=3.0, " m");
                 row(ui, "Altura base", &mut p.height, 0.0..=3.0, " m");
+            }
+            EquipmentKind::FullCar => {
+                row(ui, "Comprimento do trilho", &mut p.length, 2.0..=60.0, " m");
+                row(ui, "TDP do carro: comprimento", &mut p.car_length, 0.6..=3.0, " m");
+                row(ui, "TDP do carro: largura", &mut p.car_width, 0.6..=3.0, " m");
+                row(ui, "Altura do topo", &mut p.height, 0.1..=3.0, " m");
+                row(ui, "Velocidade dos rolos", &mut p.speed, 0.0..=3.0, " m/s");
+                row(ui, "Velocidade com pallet", &mut p.car_speed, 0.1..=4.0, " m/s");
+                row(ui, "Velocidade vazio", &mut p.car_speed_empty, 0.1..=4.0, " m/s");
+                row(ui, "Giro receber → entregar", &mut p.giro_deg, -180.0..=180.0, "°");
+                row(ui, "Velocidade do giro", &mut p.giro_speed, 5.0..=120.0, "°/s");
+                ui.label("Paradas (sensor de distância)");
+                ui.vertical(|ui| {
+                    let mut remove = None;
+                    for (i, stop) in p.stops.iter_mut().enumerate() {
+                        ui.horizontal(|ui| {
+                            let name = match i {
+                                0 => "Espera (ID 10)".to_owned(),
+                                1 => "Entrega (ID 20)".to_owned(),
+                                _ => format!("Linha {} (ID {})", (b'A' + (i as u8 - 2)) as char, (i - 1) * 100),
+                            };
+                            ui.label(name);
+                            ui.add(egui::DragValue::new(stop).speed(0.01).range(0.0..=60.0).suffix(" m"));
+                            if i > 2 && ui.small_button("🗑").clicked() {
+                                remove = Some(i);
+                            }
+                        });
+                    }
+                    if let Some(i) = remove {
+                        p.stops.remove(i);
+                    }
+                    if p.stops.len() < 8 && ui.small_button("+ linha").clicked() {
+                        let next = p.stops.last().copied().unwrap_or(1.0) + 2.0;
+                        p.stops.push(next);
+                    }
+                });
+                ui.end_row();
+                ui.label("Lógica interna");
+                ui.checkbox(&mut p.auto_logic, "FBs do carro cheio sem CLP").on_hover_text(
+                    "Busca o pallet completo na linha que pede (ID_Busca), gira e entrega; sem pedido, vai para a espera. Entradas lidas do CLP têm prioridade.",
+                );
+                ui.end_row();
             }
             EquipmentKind::ShuttleCar => {
                 row(ui, "Comprimento do trilho", &mut p.length, 2.0..=60.0, " m");
@@ -571,6 +689,8 @@ fn properties_tab(
         || before.height != eq.params.height
         || (kind.is_mesa() && before.box_size != eq.params.box_size)
         || (kind == EquipmentKind::CardboardPlacer && before.pallet_size != eq.params.pallet_size)
+        || before.car_length != eq.params.car_length
+        || before.car_width != eq.params.car_width
         || (kind == EquipmentKind::PalletElevator
             && (before.pallet_size != eq.params.pallet_size || before.stack_size != eq.params.stack_size));
     if geometry_changed {
@@ -693,8 +813,32 @@ fn properties_tab(
                 });
             }
         }
+        EquipmentKind::FullCar => {
+            if let Ok((car, ..)) = cars.get(entity) {
+                ui.separator();
+                ui.label(format!(
+                    "Posição atual {:.0} mm · velocidade {:.0} mm/s · giro {:.0}°{}",
+                    car.x * 1000.0,
+                    car.v * 1000.0,
+                    car.giro.to_degrees(),
+                    if car.loaded { " · com pallet" } else { "" }
+                ));
+            }
+            if let Ok((_, _, Some(logic))) = cars.get(entity)
+                && eq.params.auto_logic
+            {
+                ui.label(format!(
+                    "Movimento passo {} · TDP passo {} · ID_Busca {} · ID_Destino {} · INP {}",
+                    logic.passo,
+                    logic.tdp_passo,
+                    logic.id_busca,
+                    logic.id_destino,
+                    u8::from(logic.inp)
+                ));
+            }
+        }
         EquipmentKind::ShuttleCar => {
-            if let Ok((car, logic)) = cars.get(entity) {
+            if let Ok((car, Some(logic), _)) = cars.get(entity) {
                 ui.separator();
                 ui.label(format!(
                     "Posição atual {:.0} mm · velocidade {:.0} mm/s{}",
@@ -858,7 +1002,10 @@ fn auto_driven(eq: &Equipment, key: &str) -> bool {
     let actuator = match eq.kind {
         EquipmentKind::PalletizingConveyor => matches!(key, "motor" | "stop"),
         k if k.is_mesa()
-            || matches!(k, EquipmentKind::ShuttleCar | EquipmentKind::CardboardPlacer | EquipmentKind::PalletElevator) => eq.kind.signals().iter().any(|s| s.key == key && s.dir == SignalDir::In),
+            || matches!(
+                k,
+                EquipmentKind::ShuttleCar | EquipmentKind::FullCar | EquipmentKind::CardboardPlacer | EquipmentKind::PalletElevator
+            ) => eq.kind.signals().iter().any(|s| s.key == key && s.dir == SignalDir::In),
         _ => false,
     };
     actuator && eq.params.auto_logic

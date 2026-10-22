@@ -2,11 +2,13 @@ mod communication;
 mod conveyor;
 mod editor;
 mod elevator;
+mod fullcar;
 mod io;
 mod layout;
 mod mesa_logic;
 mod model;
 mod paper;
+mod pattern;
 mod robot;
 mod s7;
 mod shuttle;
@@ -75,6 +77,7 @@ fn main() {
                         sim::palletizers,
                         mesa_logic::run_mesas,
                         shuttle::shuttle_logic,
+                        fullcar::fullcar_logic,
                         paper::paper_logic,
                         elevator::elevator_logic,
                     )
@@ -82,6 +85,7 @@ fn main() {
                     // Physics, sensors and outputs.
                     (
                         shuttle::shuttle_motion,
+                        fullcar::fullcar_motion,
                         paper::paper_hold,
                         elevator::elevator_mechanics,
                         sim::emitters,
@@ -95,6 +99,7 @@ fn main() {
                         sim::removers,
                         sim::animate_conveyors,
                         shuttle::animate_shuttle,
+                        fullcar::animate_fullcar,
                         paper::animate_paper,
                         elevator::animate_elevators,
                         io::publish_outputs,

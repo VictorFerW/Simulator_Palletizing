@@ -45,8 +45,10 @@ pub struct Load {
 pub struct PalletLoad {
     /// Boxes on the pallet.
     pub placed: u32,
-    /// Robot placements (one per pick: a single box or a pair of fardos).
+    /// Placements: picks with the automatic grid, products with a pattern.
     pub units: u32,
+    /// Pattern slots already filled.
+    pub filled: Vec<u32>,
     /// Footprint of one placement, fixed by the first one.
     pub unit_size: Option<Vec3>,
     /// Cardboard sheets laid on the pallet floor.
@@ -194,16 +196,23 @@ pub fn move_loads(
         .filter(|(_, e, ..)| e.kind.is_conveyor())
         .map(|(entity, e, tf, io, mut state, car)| {
             let layout: ConveyorLayout = conveyor::layout(e);
-            let surface = conveyor::surface(e, tf, car.map(|c| c.x));
+            let surface = conveyor::surface(e, tf, car);
             let direction = match e.kind {
                 EquipmentKind::BeltConveyor | EquipmentKind::PalletConveyor if io.get_bool("reverse") => -1.0,
                 EquipmentKind::ShuttleCar if io.get_bool("Reverso_TDP") => -1.0,
+                EquipmentKind::FullCar if io.get("VelocidadeTDP") < 0.0 => -1.0,
                 _ => 1.0,
+            };
+            // The CCH TDP runs at its inverter speed, with the brake released.
+            let speed = if e.kind == EquipmentKind::FullCar {
+                if io.get_bool("LiberarFreioTDP") { io.get("VelocidadeTDP").abs() as f32 / 1000.0 } else { 0.0 }
+            } else {
+                e.params.speed
             };
             let segments: Vec<(f32, f32, f32)> = layout
                 .segments
                 .iter()
-                .map(|s| (s.x0, s.x1, if io.get_bool(s.motor) { e.params.speed } else { 0.0 }))
+                .map(|s| (s.x0, s.x1, if io.get_bool(s.motor) { speed } else { 0.0 }))
                 .collect();
             for (i, s) in segments.iter().enumerate().take(3) {
                 state.travel[i] += s.2 * direction * dt;
@@ -218,10 +227,13 @@ pub fn move_loads(
                 width: surface.width,
                 top: surface.top,
                 direction,
-                moving: car.is_some_and(|c| c.v.abs() > 1e-3),
+                moving: car.is_some_and(|c| c.v.abs() > 1e-3 || c.giro_v != 0.0),
                 single_load: matches!(
                     e.kind,
-                    EquipmentKind::PalletConveyor | EquipmentKind::PalletizingConveyor | EquipmentKind::ShuttleCar
+                    EquipmentKind::PalletConveyor
+                        | EquipmentKind::PalletizingConveyor
+                        | EquipmentKind::ShuttleCar
+                        | EquipmentKind::FullCar
                 ),
                 segments,
                 barriers: layout.barriers.iter().filter(|b| io.get_bool(b.key)).map(|b| b.x).collect(),
@@ -457,7 +469,7 @@ pub fn conveyor_sensors(
         if !eq.kind.is_conveyor() {
             continue;
         }
-        let surface = conveyor::surface(eq, tf, car.map(|c| c.x));
+        let surface = conveyor::surface(eq, tf, car);
         for sensor in conveyor::layout(eq).sensors {
             let (a, b) = photo_beam(&surface, &sensor);
             let hit = loads.iter().any(|(l, gt)| segment_hits_box(a, b, l.size, gt));
@@ -638,6 +650,9 @@ fn segment_hits_box(a: Vec3, b: Vec3, size: Vec3, gt: &GlobalTransform) -> bool 
 /// pallet center) and yaw, for a unit of footprint `unit`. Layers alternate
 /// orientation when `interlock` is set. `None` when the pallet is complete.
 pub fn pallet_slot(pattern: &Params, pallet: Vec3, unit: Vec3, index: u32) -> Option<(Vec3, f32)> {
+    if let Some(chosen) = &pattern.pattern {
+        return chosen.slot(pallet.y, unit.y, index);
+    }
     let mut remaining = index;
     for layer in 0..pattern.layers {
         let rotated = pattern.interlock && layer % 2 == 1;

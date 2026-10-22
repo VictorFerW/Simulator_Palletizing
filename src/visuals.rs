@@ -265,6 +265,7 @@ pub fn build_visual(
                         .with_children(|tdp| tdp_visual(tdp, meshes, palette, p.car_length, p.car_width, p.height));
                 });
         }
+        EquipmentKind::FullCar => fullcar_visual(parent, meshes, palette, &p),
         EquipmentKind::PalletDispenser => {
             // Magazine: four posts holding a stack of empty pallets above the TDP.
             let post_h = 1.6;
@@ -671,6 +672,108 @@ fn tdp_visual(parent: &mut ChildSpawnerCommands, meshes: &mut Assets<Mesh>, pale
     ));
 }
 
+/// Carro cheio giratório: rails, cable chain, distance sensor, the car chassis
+/// with its slewing ring and the rotating TDP (1829 x 1380, rollers on top).
+fn fullcar_visual(parent: &mut ChildSpawnerCommands, meshes: &mut Assets<Mesh>, palette: &Palette, p: &crate::model::Params) {
+    let rail = meshes.add(Cuboid::new(p.length, 0.05, 0.07));
+    for z in [-0.5, 0.5] {
+        parent.spawn((
+            Mesh3d(rail.clone()),
+            MeshMaterial3d(palette.steel.clone()),
+            Transform::from_xyz(0.0, 0.025, z),
+        ));
+    }
+    let reach = crate::fullcar::turn_radius(p);
+    parent.spawn((
+        Mesh3d(meshes.add(Cuboid::new(p.length, 0.1, 0.12))),
+        MeshMaterial3d(palette.dark.clone()),
+        Transform::from_xyz(0.0, 0.05, reach + 0.2),
+    ));
+    parent.spawn((
+        Mesh3d(meshes.add(Cuboid::new(0.08, 0.1, 0.1))),
+        MeshMaterial3d(palette.fanuc_yellow.clone()),
+        Transform::from_xyz(-p.length / 2.0 - 0.06, 0.25, 0.0),
+    ));
+    parent
+        .spawn((
+            Transform::from_xyz(p.stops.first().copied().unwrap_or(0.0) - p.length / 2.0, 0.0, 0.0),
+            Visibility::default(),
+            crate::shuttle::ShuttleBody,
+        ))
+        .with_children(|car| {
+            // Chassis with wheels and drive, slewing ring.
+            car.spawn((
+                Mesh3d(meshes.add(Cuboid::new(1.3, 0.22, 1.2))),
+                MeshMaterial3d(palette.frame_grey.clone()),
+                Transform::from_xyz(0.0, 0.17, 0.0),
+            ));
+            let wheel = meshes.add(Cylinder::new(0.1, 0.06));
+            for (x, z) in [(-0.55, -0.5), (0.55, -0.5), (-0.55, 0.5), (0.55, 0.5)] {
+                car.spawn((
+                    Mesh3d(wheel.clone()),
+                    MeshMaterial3d(palette.dark.clone()),
+                    Transform::from_xyz(x, 0.1, z).with_rotation(Quat::from_rotation_x(FRAC_PI_2)),
+                ));
+            }
+            car.spawn((
+                Mesh3d(meshes.add(Cuboid::new(0.45, 0.18, 0.2))),
+                MeshMaterial3d(palette.dark.clone()),
+                Transform::from_xyz(0.3, 0.2, 0.62),
+            ));
+            car.spawn((
+                Mesh3d(meshes.add(Cylinder::new(0.48, 0.06))),
+                MeshMaterial3d(palette.steel.clone()),
+                Transform::from_xyz(0.0, 0.31, 0.0),
+            ));
+            car.spawn((
+                Transform::from_rotation(Quat::from_rotation_y(-FRAC_PI_2)),
+                Visibility::default(),
+                crate::fullcar::FullCarTop,
+            ))
+            .with_children(|top| {
+                // Round TDP: checker plate disc, rim, and rollers cut to the circle so the
+                // turning TDP clears the neighbouring TDPs.
+                let (cl, cw) = (p.car_length, p.car_width);
+                let radius = crate::fullcar::turn_radius(p);
+                top.spawn((
+                    Mesh3d(meshes.add(Cylinder::new(radius, 0.03))),
+                    MeshMaterial3d(palette.steel.clone()),
+                    Transform::from_xyz(0.0, p.height - 0.085, 0.0),
+                ));
+                top.spawn((
+                    Mesh3d(meshes.add(Cylinder::new(radius + 0.01, 0.1))),
+                    MeshMaterial3d(palette.dark.clone()),
+                    Transform::from_xyz(0.0, p.height - 0.15, 0.0),
+                ));
+                // Side guides along the transport direction, inside the circle.
+                let guide_half = (radius * radius - (cw / 2.0 + 0.04).powi(2)).max(0.0).sqrt();
+                let guide = meshes.add(Cuboid::new(2.0 * guide_half, 0.08, 0.04));
+                for side in [-1.0, 1.0] {
+                    top.spawn((
+                        Mesh3d(guide.clone()),
+                        MeshMaterial3d(palette.frame_grey.clone()),
+                        Transform::from_xyz(0.0, p.height - 0.03, side * (cw / 2.0 + 0.04)),
+                    ));
+                }
+                let count = (cl / TDP_ROLLER_PITCH).floor().max(1.0) as i32;
+                let start = -(count as f32 - 1.0) * TDP_ROLLER_PITCH / 2.0;
+                for i in 0..count {
+                    let x = start + i as f32 * TDP_ROLLER_PITCH;
+                    let half = ((radius - 0.05).powi(2) - x * x).max(0.0).sqrt().min(cw / 2.0);
+                    if half < 0.1 {
+                        continue;
+                    }
+                    top.spawn((
+                        Mesh3d(meshes.add(Cylinder::new(TDP_ROLLER_RADIUS, 2.0 * half))),
+                        MeshMaterial3d(palette.roller.clone()),
+                        Transform::from_xyz(x, p.height - TDP_ROLLER_RADIUS, 0.0).with_rotation(Quat::from_rotation_x(FRAC_PI_2)),
+                        Roller { stage: 0, radius: TDP_ROLLER_RADIUS },
+                    ));
+                }
+            });
+        });
+}
+
 /// Elevador de pallets: four columns around the TDP, top rails and the drive
 /// beam, the clamp bars with their forks and the stack of empty pallets.
 fn elevator_visual(parent: &mut ChildSpawnerCommands, meshes: &mut Assets<Mesh>, palette: &Palette, p: &crate::model::Params) {
@@ -886,8 +989,9 @@ fn robot_visual(parent: &mut ChildSpawnerCommands, meshes: &mut Assets<Mesh>, pa
 }
 
 /// Cabeçote Selgron "4 fardos" (0323P01-010000): 1234 x 500 mm frame with the
-/// flange coupling 435 mm above its bottom (the TCP), central divider and two
-/// pneumatic clamps (pinças) 295 mm tall that close along the gripper Z.
+/// flange coupling 435 mm above its bottom (origin of this part), central divider
+/// and two pneumatic clamps (pinças) 295 mm tall that close along the gripper Z.
+/// The fardos sit at the bottom, between the clamp tips (the TCP).
 fn robot_gripper(parent: &mut ChildSpawnerCommands, meshes: &mut Assets<Mesh>, palette: &Palette) {
     let tool = robot::TOOL_LENGTH;
     parent

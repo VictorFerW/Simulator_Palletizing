@@ -24,6 +24,9 @@ pub enum EquipmentKind {
     Sensor,
     /// Carro de pallet vazio (CVZ): car with a TDP on a rail.
     ShuttleCar,
+    /// Carro cheio giratório (CCH): car with a rotating TDP that takes full pallets
+    /// from the palletizing lines to the delivery.
+    FullCar,
     /// Colocador de papelão (CP): lays cardboard sheets on pallets.
     CardboardPlacer,
     /// Elevador de pallets (alimentador): keeps a stack of empty pallets lifted
@@ -32,13 +35,14 @@ pub enum EquipmentKind {
 }
 
 impl EquipmentKind {
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 14] = [
         Self::BeltConveyor,
         Self::Table2Stage,
         Self::Table3Stage,
         Self::PalletConveyor,
         Self::PalletizingConveyor,
         Self::ShuttleCar,
+        Self::FullCar,
         Self::CardboardPlacer,
         Self::PalletElevator,
         Self::Robot,
@@ -61,6 +65,7 @@ impl EquipmentKind {
             Self::BoxRemover => "Removedor (caixas/pallets)",
             Self::Sensor => "Sensor fotoelétrico",
             Self::ShuttleCar => "Carro de pallet vazio (CVZ)",
+            Self::FullCar => "Carro cheio giratório (CCH)",
             Self::CardboardPlacer => "Colocador de papelão (CP)",
             Self::PalletElevator => "Elevador de pallets (alimentador)",
         }
@@ -79,6 +84,7 @@ impl EquipmentKind {
             Self::BoxRemover => "Removedor",
             Self::Sensor => "Sensor",
             Self::ShuttleCar => "CVZ",
+            Self::FullCar => "CCH",
             Self::CardboardPlacer => "CP",
             Self::PalletElevator => "Elevador",
         }
@@ -94,6 +100,7 @@ impl EquipmentKind {
                 | Self::PalletConveyor
                 | Self::PalletizingConveyor
                 | Self::ShuttleCar
+                | Self::FullCar
         )
     }
 
@@ -121,6 +128,7 @@ impl EquipmentKind {
             Self::BoxRemover => REMOVER_SIGNALS,
             Self::Sensor => SENSOR_SIGNALS,
             Self::ShuttleCar => SHUTTLE_SIGNALS,
+            Self::FullCar => FULLCAR_SIGNALS,
             Self::CardboardPlacer => PAPER_SIGNALS,
             Self::PalletElevator => ELEVATOR_SIGNALS,
         }
@@ -242,6 +250,30 @@ const ELEVATOR_SIGNALS: &[SignalDef] = &[
     SignalDef::new("SensorPilhaPallet", "Pallet na pilha", Out, Bool),
     SignalDef::new("SensorTDP", "Pallet no TDP", Out, Bool),
 ];
+// FBs "Carro Cheio Movimento" + "Carro Cheio TDP" (CCH).
+const FULLCAR_SIGNALS: &[SignalDef] = &[
+    SignalDef::new("Motor", "Motor do carro", In, Bool),
+    SignalDef::new("LiberarFreio", "Liberar freio do carro", In, Bool),
+    SignalDef::new("Velocidade", "Velocidade do carro (mm/s, com sinal)", In, Int),
+    SignalDef::new("MotorTDP", "Motor TDP", In, Bool),
+    SignalDef::new("LiberarFreioTDP", "Liberar freio TDP", In, Bool),
+    SignalDef::new("VelocidadeTDP", "Velocidade TDP (mm/s, com sinal)", In, Int),
+    SignalDef::new("MotorGiro", "Motor giro", In, Bool),
+    SignalDef::new("LiberarFreioGiro", "Liberar freio giro", In, Bool),
+    SignalDef::new("VelocidadeGiro", "Velocidade giro (°/s, + entregar)", In, Int),
+    SignalDef::new("PosicaoAtual", "Sensor de distância (mm)", Out, Int),
+    SignalDef::new("DriverVelocidade", "Velocidade real do carro (mm/s)", Out, Int),
+    SignalDef::new("DriverFalha", "Inversor em falha", Out, Bool),
+    SignalDef::new("FimDeCurso", "Fim de curso do trilho", Out, Bool),
+    SignalDef::new("Sensor1", "Sensor 1 (entrada)", Out, Bool),
+    SignalDef::new("Sensor2", "Sensor 2", Out, Bool),
+    SignalDef::new("Sensor3", "Sensor 3 (centro)", Out, Bool),
+    SignalDef::new("Sensor4", "Sensor 4 (fora do centro)", Out, Bool),
+    SignalDef::new("Giro_Sensor_PosReceber", "Giro na posição receber", Out, Bool),
+    SignalDef::new("Giro_Sensor_PosEntregar", "Giro na posição entregar", Out, Bool),
+    SignalDef::new("VelocidadeAtualTDP", "Velocidade real TDP (mm/s)", Out, Int),
+    SignalDef::new("VelocidadeAtualGiro", "Velocidade real giro (°/s)", Out, Int),
+];
 // FB "CVZ" (carro vazio): inverter, brake, distance sensor, TDP on board.
 const SHUTTLE_SIGNALS: &[SignalDef] = &[
     SignalDef::new("LigarDrive", "Ligar inversor", In, Bool),
@@ -321,8 +353,14 @@ pub struct Params {
     pub car_length: f32,
     /// CVZ: TDP on the car, width (along the rail).
     pub car_width: f32,
-    /// CVZ: nominal travel speed (m/s).
+    /// CVZ: nominal travel speed (m/s); CCH: speed with a pallet (VelocidadeRapida).
     pub car_speed: f32,
+    /// CCH: speed without a pallet (VelocidadeRapidoVazio).
+    pub car_speed_empty: f32,
+    /// CCH: rotation of the TDP from receiving to delivering (degrees, + counter-clockwise).
+    pub giro_deg: f32,
+    /// CCH: giro speed (°/s).
+    pub giro_speed: f32,
     /// CVZ: stop positions read by the distance sensor (m): coleta, then posição A, B...
     pub stops: Vec<f32>,
     /// CVZ: index of the stop under a colocador de papelão (-1: none).
@@ -335,6 +373,9 @@ pub struct Params {
     pub cp_two_sheets: bool,
     /// Elevador: pallets in a full stack.
     pub stack_size: u32,
+    /// TDP de paletização: layer pattern chosen in "Padrões de paletização" (else
+    /// the automatic column / interlocked grid).
+    pub pattern: Option<crate::pattern::Pattern>,
     /// Elevador: a new stack is set on the TDP when the last pallet leaves.
     pub auto_refill: bool,
 }
@@ -373,12 +414,16 @@ impl Default for Params {
             car_length: 1.56,
             car_width: 1.28,
             car_speed: 1.0,
+            car_speed_empty: 1.0,
+            giro_deg: 90.0,
+            giro_speed: 30.0,
             stops: vec![1.0, 4.0, 7.0],
             paper_stop: -1,
             cp_stroke: 1.05,
             apply_paper: true,
             cp_two_sheets: false,
             stack_size: 10,
+            pattern: None,
             auto_refill: true,
         }
     }
@@ -413,6 +458,20 @@ impl Params {
             EquipmentKind::BoxRemover => Self { length: 1.2, width: 1.4, height: 0.0, ..base },
             // Rail 8 m; car TDP 1560 x 1280 at 500 mm, like the fixed TDPs.
             EquipmentKind::ShuttleCar => Self { length: 8.0, width: 1.56, height: 0.5, speed: 0.25, ..base },
+            // CCH (MOD CARRO ALIMENT ROTATIVO): TDP 1829 x 1380 at 514 mm on a slewing ring.
+            // Stops: espera, entrega, linha A, linha B.
+            EquipmentKind::FullCar => Self {
+                length: 10.0,
+                width: 1.38,
+                height: 0.514,
+                speed: 0.25,
+                car_length: 1.829,
+                car_width: 1.38,
+                car_speed: 0.6,
+                car_speed_empty: 1.0,
+                stops: vec![1.0, 9.0, 3.0, 5.5],
+                ..base
+            },
             // CP C2370: 1887 mm between the deposit and the delivery position.
             EquipmentKind::CardboardPlacer => Self { length: 1.887, width: 1.6, height: 0.0, ..base },
             // Over a TDP: frame around the pallet, `height` = TDP top.
@@ -451,6 +510,11 @@ impl Equipment {
                 Vec3::new(-p.length / 2.0 - 0.06, 0.0, -p.width / 2.0 - 0.06),
                 Vec3::new(p.length / 2.0 + 0.06, p.height + 2.1, p.width / 2.0 + 0.06),
             ),
+            EquipmentKind::FullCar => {
+                // Round TDP turning on the car.
+                let half = crate::fullcar::turn_radius(p);
+                (Vec3::new(-p.length / 2.0, 0.0, -half), Vec3::new(p.length / 2.0, p.height + 0.1, half + 0.3))
+            }
             EquipmentKind::ShuttleCar => (
                 Vec3::new(-p.length / 2.0, 0.0, -p.car_length / 2.0 - 0.1),
                 Vec3::new(p.length / 2.0, p.height + 0.1, p.car_length / 2.0 + 0.3),

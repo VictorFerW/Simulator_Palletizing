@@ -19,11 +19,13 @@ pub struct Surface {
     pub top: f32,
 }
 
-pub fn surface(eq: &Equipment, tf: &Transform, car_x: Option<f32>) -> Surface {
+pub fn surface(eq: &Equipment, tf: &Transform, car: Option<&crate::shuttle::ShuttleState>) -> Surface {
     let p = &eq.params;
-    if eq.kind == EquipmentKind::ShuttleCar {
-        let car = Transform::from_xyz(car_x.unwrap_or(0.0) - p.length / 2.0, 0.0, 0.0)
-            .with_rotation(Quat::from_rotation_y(-std::f32::consts::FRAC_PI_2));
+    if matches!(eq.kind, EquipmentKind::ShuttleCar | EquipmentKind::FullCar) {
+        // The car TDP transports across the rail; the CCH turns it by `giro`.
+        let (x, giro) = car.map_or((0.0, 0.0), |c| (c.x, c.giro));
+        let car = Transform::from_xyz(x - p.length / 2.0, 0.0, 0.0)
+            .with_rotation(Quat::from_rotation_y(-std::f32::consts::FRAC_PI_2 + giro));
         return Surface { transform: *tf * car, length: p.car_length, width: p.car_width, top: p.height };
     }
     Surface { transform: *tf, length: p.length, width: p.width, top: p.height }
@@ -111,6 +113,21 @@ pub fn layout(eq: &Equipment) -> ConveyorLayout {
             ConveyorLayout {
                 segments: vec![Segment { x0: -cl / 2.0, x1: cl / 2.0, motor: "Motor_TDP" }],
                 sensors: vec![PhotoSensor { key: "Sensor_Pallet_Carro", x: cl / 2.0 - 0.1, z0: -cw / 2.0, z1: cw / 2.0 }],
+                ..Default::default()
+            }
+        }
+        EquipmentKind::FullCar => {
+            // Sensor 1 at the entry; 2 and 3 covered by a centred pallet; 4 past the centre.
+            let (cl, cw, half) = (p.car_length, p.car_width, p.pallet_size[0] / 2.0);
+            let beam = |key, x| PhotoSensor { key, x, z0: -cw / 2.0, z1: cw / 2.0 };
+            ConveyorLayout {
+                segments: vec![Segment { x0: -cl / 2.0, x1: cl / 2.0, motor: "MotorTDP" }],
+                sensors: vec![
+                    beam("Sensor1", -cl / 2.0 + 0.1),
+                    beam("Sensor2", -half + 0.15),
+                    beam("Sensor3", half - 0.05),
+                    beam("Sensor4", (half + 0.12).min(cl / 2.0 - 0.05)),
+                ],
                 ..Default::default()
             }
         }
