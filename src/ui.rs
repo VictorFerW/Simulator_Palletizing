@@ -264,7 +264,7 @@ pub fn ui_system(
     if !state.pattern.env_checked {
         state.pattern.env_checked = true;
         state.pattern.open = std::env::var("PDT_PATTERN").is_ok();
-        state.pattern.auto_apply = std::env::var("PDT_PATTERN").is_ok_and(|v| v == "apply");
+        state.pattern.auto_apply = std::env::var("PDT_PATTERN").is_ok_and(|v| v.starts_with("apply"));
     }
     if state.pattern.open {
         let tdps: Vec<(String, f32)> = equipment
@@ -462,6 +462,13 @@ fn properties_tab(
                 row(ui, "Velocidade dos roletes", &mut p.speed, 0.0..=3.0, " m/s");
                 row(ui, "Fardo: comprimento", &mut p.box_size[0], 0.1..=1.2, " m");
                 row(ui, "Fardo: largura", &mut p.box_size[2], 0.1..=1.0, " m");
+                if kind == EquipmentKind::Table3Stage {
+                    ui.label("Receita 10x1");
+                    ui.checkbox(&mut p.fardo_10kg, "Fardo10Kg: grupos de 3 ou 4 fardos lado a lado").on_hover_text(
+                        "A garra empurra a fileira a cada fardo, o empurrador leva o primeiro ao batente e a coleta recebe 3 ou 4 fardos, conforme a pega do robô",
+                    );
+                    ui.end_row();
+                }
                 ui.label("Lógica interna");
                 ui.checkbox(&mut p.auto_logic, "FB da mesa e da coleta sem CLP")
                     .on_hover_text("Executa o port dos FBs Selgron. Atuadores lidos do CLP têm prioridade.");
@@ -687,7 +694,7 @@ fn properties_tab(
     let geometry_changed = before.length != eq.params.length
         || before.width != eq.params.width
         || before.height != eq.params.height
-        || (kind.is_mesa() && before.box_size != eq.params.box_size)
+        || (kind.is_mesa() && (before.box_size != eq.params.box_size || before.fardo_10kg != eq.params.fardo_10kg))
         || (kind == EquipmentKind::CardboardPlacer && before.pallet_size != eq.params.pallet_size)
         || before.car_length != eq.params.car_length
         || before.car_width != eq.params.car_width
@@ -867,6 +874,9 @@ fn properties_tab(
                         u8::from(logic.coleta.recebido),
                         u8::from(logic.coleta.autoriza_pick)
                     ));
+                    if eq.params.fardo_10kg {
+                        ui.label(format!("Receita 10x1 · próximo grupo: {} fardos (FardosPonto)", logic.fardos_ponto));
+                    }
                 } else {
                     ui.weak("Lógica interna desligada: os atuadores vêm do CLP ou do \"forçar\".");
                 }

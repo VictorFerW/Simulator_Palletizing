@@ -189,45 +189,68 @@ pub fn process_layout_requests(
     requests.clear = false;
 }
 
-/// Emitter -> belt -> Mesa 2 estágios -> FANUC M-410iC/185 -> pallet on the
-/// TDP de paletização, fed by a pallet magazine and discharged to an outfeed TDP.
+/// Default cell (Selgron layout): Linha 1A/1 (with Linha 1B joining from the side)
+/// and Linha 2 feed two Mesas 2 estágios; the FANUC M-410iC/185 palletizes on three
+/// rows of TDPs (palletizing module first, then accumulation) that discharge into the
+/// carro cheio giratório, which takes the full pallets up to the outfeed.
+/// Robot at the origin, X to the right of the drawing, Z down the drawing.
 pub fn spawn_default_cell(commands: &mut Commands, meshes: &mut Assets<Mesh>, palette: &Palette) {
-    let mut add = |kind: EquipmentKind, name: &str, pos: Vec3, yaw_deg: f32| {
+    let mut add = |kind: EquipmentKind, name: &str, (x, z): (f32, f32), yaw_deg: f32, tweak: &dyn Fn(&mut Params)| {
+        let mut params = Params::for_kind(kind);
+        tweak(&mut params);
         spawn_equipment(
             commands,
             meshes,
             palette,
-            Equipment { name: name.into(), kind, params: Params::for_kind(kind) },
-            Transform::from_translation(pos).with_rotation(Quat::from_rotation_y(yaw_deg.to_radians())),
+            Equipment { name: name.into(), kind, params },
+            Transform::from_xyz(x, 0.0, z).with_rotation(Quat::from_rotation_y(yaw_deg.to_radians())),
             TagBindings::default(),
         );
     };
-    add(EquipmentKind::BoxEmitter, "Emissor_1", Vec3::new(-6.0, 0.0, 0.0), 0.0);
-    add(EquipmentKind::BeltConveyor, "Esteira_1", Vec3::new(-4.4, 0.0, 0.0), 0.0);
-    // The belt feeds the mesa entry lane (posição 1), offset from the mesa axis.
-    let entry_lane = Params::for_kind(EquipmentKind::Table2Stage).box_size[2] / 2.0 + 0.01;
-    add(EquipmentKind::Table2Stage, "Mesa2E_1", Vec3::new(-1.2, 0.0, -entry_lane), 0.0);
-    // J1 has ±180°: 0° points between the mesa (behind) and the pallet (side), so
-    // the transfers never cross the ±180° limit.
-    add(EquipmentKind::Robot, "FANUC_M410iC_1", Vec3::new(1.6, 0.0, 0.0), -135.0);
-    // TDP 1560 mm modules, end to end.
-    add(EquipmentKind::PalletConveyor, "TDP_1", Vec3::new(0.04, 0.0, 2.1), 0.0);
-    add(EquipmentKind::PalletDispenser, "Magazine_1", Vec3::new(0.04, 0.0, 2.1), 0.0);
-    add(EquipmentKind::PalletizingConveyor, "TDP_Palet_1", Vec3::new(1.6, 0.0, 2.1), 0.0);
-    add(EquipmentKind::PalletConveyor, "TDP_2", Vec3::new(3.16, 0.0, 2.1), 0.0);
-    // Removes the full pallet once it stops at the end of the outfeed TDP.
-    spawn_equipment(
-        commands,
-        meshes,
-        palette,
-        Equipment {
-            name: "Removedor_1".into(),
-            kind: EquipmentKind::BoxRemover,
-            params: Params { length: 0.8, ..Params::for_kind(EquipmentKind::BoxRemover) },
-        },
-        Transform::from_xyz(3.7, 0.0, 2.1),
-        TagBindings::default(),
-    );
+    let none = |_: &mut Params| {};
+    // The belts feed the mesa entry lane (posição 1), offset from the mesa axis.
+    let lane = Params::for_kind(EquipmentKind::Table2Stage).box_size[2] / 2.0 + 0.01;
+
+    // Linha 1A + Linha 1 -> Mesa 1; Linha 1B joins Linha 1 from the side.
+    let z1 = -0.45;
+    add(EquipmentKind::BoxEmitter, "Emissor_Linha1A", (-7.8, z1), 0.0, &none);
+    add(EquipmentKind::BeltConveyor, "Linha_1", (-5.5, z1), 0.0, &|p| p.length = 4.6);
+    add(EquipmentKind::BoxEmitter, "Emissor_Linha1B", (-4.6, -2.9), -90.0, &|p| p.interval = 12.0);
+    add(EquipmentKind::BeltConveyor, "Linha_1B", (-4.6, -1.88), -90.0, &|p| p.length = 2.0);
+    add(EquipmentKind::Table2Stage, "Mesa_1", (-2.0, z1 - lane), 0.0, &none);
+    // Linha 2 -> Mesa 2.
+    let z2 = 1.35;
+    add(EquipmentKind::BoxEmitter, "Emissor_Linha2", (-6.2, z2), 0.0, &none);
+    add(EquipmentKind::BeltConveyor, "Linha_2", (-4.7, z2), 0.0, &|p| p.length = 3.0);
+    add(EquipmentKind::Table2Stage, "Mesa_2", (-2.0, z2 - lane), 0.0, &none);
+
+    // J1 has ±180°: 0° points away from the widest free sector, so no transfer
+    // between the mesas and the three pallets crosses the ±180° limit.
+    add(EquipmentKind::Robot, "FANUC_M410iC_1", (0.0, 0.0), 141.0, &none);
+
+    // Three rows of TDP 1560 mm toward the carro cheio (receive edge at x = 4.085).
+    let palletizing = |p: &mut Params| p.layers = 4;
+    for (row, z, first) in [("1", -1.62, 0.185), ("2", -0.15, 1.745), ("3", 1.47, 0.185)] {
+        add(EquipmentKind::PalletizingConveyor, &format!("TDP_Palet_{row}"), (first, z), 0.0, &palletizing);
+        add(EquipmentKind::PalletDispenser, &format!("Magazine_{row}"), (first, z), 0.0, &none);
+        let mut x = first + 1.56;
+        let mut n = 1;
+        while x < 3.4 {
+            add(EquipmentKind::PalletConveyor, &format!("TDP_Linha{row}_{n}"), (x, z), 0.0, &none);
+            x += 1.56;
+            n += 1;
+        }
+    }
+
+    // Carro cheio giratório: rail along Z (start at the bottom, z = 3.3); stops from
+    // the rail start: espera, entrega (top), linha A (row 3), B (row 2), C (row 1).
+    add(EquipmentKind::FullCar, "CCH_1", (5.0, -0.9), 90.0, &|p| {
+        p.length = 8.4;
+        p.stops = vec![4.2, 7.4, 3.3 - 1.47, 3.3 + 0.15, 3.3 + 1.62];
+    });
+    // Outfeed at the top (the car delivers along the rail after turning 90°).
+    add(EquipmentKind::PalletConveyor, "TDP_Saida", (5.0, -5.8), 90.0, &none);
+    add(EquipmentKind::BoxRemover, "Removedor_Saida", (5.0, -6.4), 90.0, &|p| p.length = 0.8);
 }
 
 pub fn setup_default_cell(mut requests: ResMut<LayoutRequests>) {

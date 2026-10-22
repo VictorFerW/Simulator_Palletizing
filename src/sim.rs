@@ -386,6 +386,12 @@ pub fn mesa_mechanics(
                 let step = dt / PUSHER_TIME;
                 mech.stroke[i] += (t - mech.stroke[i]).clamp(-step, step);
             }
+            // Both valves off (cilindro aliviado): the plate stays where it is but does
+            // not push; the fardos arriving push it back.
+            let relieved = !pusher.comb && !adv && !ret;
+            if relieved {
+                mech.stroke[i] = (mech.stroke[i] - dt / PUSHER_TIME).max(0.0);
+            }
             match pusher.lift {
                 Some((up, down, sensor_up, sensor_down)) => {
                     let target = match (io.get_bool(up), io.get_bool(down)) {
@@ -410,16 +416,16 @@ pub fn mesa_mechanics(
                 let delta = span * (mech.stroke[i] - old_stroke);
                 let carrying = mech.lift[i] >= 0.9 && mech.stroke[i] > old_stroke;
                 let reach = eq.params.box_size[2] / 2.0;
+                let ahead = (pusher.face_end - pusher.face_start).signum();
                 for (mut load, mut ltf) in &mut loads {
                     if load.state != LoadState::Free {
                         continue;
                     }
                     let mut local = inverse.transform_point3(ltf.translation);
                     let bottom = local.y - load.size.y / 2.0 - eq.params.height;
-                    let over = local.x >= pusher.x0
-                        && local.x <= pusher.x1
-                        && (-0.06..0.1).contains(&bottom)
-                        && (local.z - center_old).abs() < reach;
+                    let in_row = (local.z - center_old).abs() < reach
+                        || (pusher.train && (local.z - center_old) * ahead > 0.0 && local.z.abs() <= eq.params.width / 2.0);
+                    let over = local.x >= pusher.x0 && local.x <= pusher.x1 && (-0.06..0.1).contains(&bottom) && in_row;
                     if carrying && over {
                         local.z += delta;
                         local.y = eq.params.height + load.size.y / 2.0 + 0.04;
@@ -432,7 +438,7 @@ pub fn mesa_mechanics(
                 }
                 continue;
             }
-            if mech.lift[i] < 0.9 || dt <= 0.0 {
+            if mech.lift[i] < 0.9 || dt <= 0.0 || relieved {
                 continue;
             }
             let face = pusher.face_start + (pusher.face_end - pusher.face_start) * mech.stroke[i];

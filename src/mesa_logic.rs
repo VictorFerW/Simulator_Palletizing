@@ -7,7 +7,10 @@
 //! Última camada ímpar (mesa 2 estágios): when the robot asks for a single fardo
 //! (`single_request`, the last product of a pallet) only one enters, the empurrador
 //! pushes it and the roletada releases it to the coleta, which then waits for the
-//! pushed side only. 10x1 and 10 kg variants are off (`Produto_10x1 = 0`, `Fardo10Kg = 0`).
+//! pushed side only. Mesa 3 estágios: besides the normal recipe, the receita 10x1
+//! (`Fardo10Kg = 1`, steps 100..300 of the roletada and 100..202 of the
+//! pré-formadora) forms groups of 3 or 4 fardos side by side; the number comes from
+//! the robot (`FardosPonto`). `Produto_10x1` of the mesa 2 estágios stays off.
 //! Actuators driven by a connected PLC always win over this logic.
 
 use bevy::prelude::*;
@@ -42,6 +45,7 @@ const TEMPO_LIBERAR_BATENTE: f32 = 0.5;
 const TEMPO_ATRASO_BLOQUEIO_ENTRADA: f32 = 0.5;
 const TEMPO_ATRASO_BLOQUEIO_MEIO: f32 = 0.5;
 const TEMPO_ENTRADA_FARDOS: f32 = 0.4;
+const TEMPO_PRESSAO_ETAPA2_PAC1: f32 = 0.5;
 
 /// FB "Mesa Antecipada Coleta".
 #[derive(Default, Debug)]
@@ -471,6 +475,14 @@ pub struct PreForma3 {
     t_ent_pre: Ton,
     t_simu_rol_pre: Ton,
     t_simul_pre_col: Ton,
+    /// Receita 10x1 (Fardo10Kg) and the group size asked for the coleta (FardosPonto).
+    pub fardo_10kg: bool,
+    pub fardos_ponto: u32,
+    /// Recipe of the last scan: a change restarts both sequences (Tipo_Produto_Alterado).
+    last_10kg: bool,
+    solicitar_fardo_pac1: bool,
+    espera_pressao: bool,
+    t_pressao: Ton,
 }
 
 struct Sensors3 {
@@ -497,6 +509,13 @@ impl PreForma3 {
         let q_ent_pre = self.t_ent_pre.run(self.espera_ent_pac_pre, TEMPO_ENTRADA_FARDOS, dt);
         let q_simu_rol_pre = self.t_simu_rol_pre.run(self.espera_simul_rol_pre, TEMPO_SIMULTANEIDADE, dt);
         let q_simul_pre_col = self.t_simul_pre_col.run(self.espera_simul_pre_col, TEMPO_SIMULTANEIDADE, dt);
+        let q_pressao = self.t_pressao.run(self.espera_pressao, TEMPO_PRESSAO_ETAPA2_PAC1, dt);
+        if self.fardo_10kg != self.last_10kg {
+            // Reinicia a mesa quando troca a receita de 6x5 para 10x1.
+            self.last_10kg = self.fardo_10kg;
+            self.passo_roletada = 0;
+            self.passo_preformadora = 0;
+        }
 
         // Condição geral: garra recuada pode subir.
         let raise_if_back = |me: &mut Self| {
@@ -507,6 +526,190 @@ impl PreForma3 {
         };
 
         match self.passo_roletada {
+            0 if self.fardo_10kg => {
+                // Vetor de reset (Fardo10Kg = 1)
+                self.garra_avancar = false;
+                self.garra_desce = true;
+                self.garra_recuar = true;
+                self.garra_sobe = false;
+                self.bloqueio_meio = true;
+                self.bloqueio_entrada = true;
+                if s.e1p1 && !s.e1p2 && !s.e1p3 {
+                    self.passo_roletada = 102;
+                }
+                if !s.e1p1 && !s.e1p2 && !s.e1p3 {
+                    self.passo_roletada = 100;
+                }
+                if (s.e1p2 || s.e1p3) && self.passo_roletada == 0 {
+                    self.passo_roletada = 300;
+                    self.garra_sobe = true;
+                    self.garra_desce = false;
+                }
+            }
+            100 => {
+                // Receber primeiro fardo na roletada
+                self.bloqueio_entrada = true;
+                self.bloqueio_meio = true;
+                if s.esteira && !s.e1p1 && !s.pac1_prox_bloq {
+                    self.motor_roletada = true;
+                    self.bloqueio_entrada = false;
+                    self.passo_roletada = 101;
+                }
+                raise_if_back(self);
+            }
+            101 | 202 => {
+                // Aguarda fardo acionar sensor na roleta
+                raise_if_back(self);
+                self.espera_pac_rol = s.pac1_prox_bloq || s.e1p1;
+                if s.e1p1 {
+                    self.espera_ent_pac_rol = true;
+                }
+                if q_sep_rol {
+                    self.espera_pac_rol = false;
+                    self.bloqueio_entrada = true;
+                    self.passo_roletada = if self.passo_roletada == 101 { 102 } else { 203 };
+                }
+            }
+            102 => {
+                // Espera o tempo para verificar qual ação tomar
+                raise_if_back(self);
+                self.espera_ent_pac_rol = s.e1p1;
+                if q_ent_pac_rol {
+                    self.motor_roletada = false;
+                }
+                // Mandar um fardo para a pré-formadora
+                if self.solicitar_fardo_pac1 {
+                    self.espera_ent_pac_rol = false;
+                    self.motor_preformadora = true;
+                    self.bloqueio_meio = false;
+                    self.motor_roletada = true;
+                    self.passo_roletada = 103;
+                }
+                // Está solicitando 2 fardos: primeiro acumular os dois
+                if self.solicitar_fardo && q_ent_pac_rol {
+                    self.garra_sobe = true;
+                    self.garra_desce = false;
+                    if s.garra_levantada {
+                        self.garra_avancar = true;
+                        self.garra_recuar = false;
+                        self.espera_ent_pac_rol = false;
+                        self.passo_roletada = 200;
+                    }
+                }
+            }
+            103 | 206 => {
+                // Espera fardo(s) chegar(em) na pré-formadora para levantar o bloqueio
+                let step = self.passo_roletada;
+                raise_if_back(self);
+                if step == 103 {
+                    if (s.e2p1 || s.e2p2) && self.passo_preformadora != 111 {
+                        self.espera_pac_pre = true;
+                    }
+                    if s.e2p1 && s.e2p2 && self.passo_preformadora == 111 {
+                        self.espera_pac_pre = true;
+                    }
+                } else if s.e2p3 {
+                    self.espera_pac_pre = true;
+                }
+                if q_sep_pre && !q_simu_rol_pre {
+                    self.bloqueio_meio = true;
+                    self.espera_simul_rol_pre = false;
+                    self.espera_pac_pre = false;
+                    self.passo_roletada = 100;
+                    self.motor_roletada = false;
+                }
+                // Tratamento para simultaneidade
+                let empty = if step == 103 { !s.e1p1 && !s.pac1_prox_bloq && s.esteira } else { !s.e1p1 && !s.e1p2 && !s.e1p3 && !s.pac1_prox_bloq };
+                if empty && self.passo_roletada == step {
+                    self.espera_simul_rol_pre = true;
+                }
+                if s.esteira && q_simu_rol_pre {
+                    self.motor_roletada = true;
+                    self.bloqueio_entrada = false;
+                }
+                self.espera_pac_rol = (s.pac1_prox_bloq || s.e1p1) && q_simu_rol_pre;
+                if s.e1p1 && q_simu_rol_pre {
+                    self.espera_ent_pac_rol = true;
+                } else if step == 206 {
+                    self.espera_ent_pac_rol = false;
+                }
+                if q_sep_rol {
+                    self.bloqueio_entrada = true;
+                }
+                if q_sep_pre {
+                    self.bloqueio_meio = true;
+                }
+                if q_simu_rol_pre && q_sep_rol && q_sep_pre && self.passo_roletada == step {
+                    self.espera_ent_pac_rol = step == 206;
+                    self.espera_pac_rol = false;
+                    self.espera_pac_pre = false;
+                    self.espera_simul_rol_pre = false;
+                    self.passo_roletada = 102;
+                }
+            }
+            200 | 204 => {
+                // Aguarda a garra avançar e acionar o sensor do pacote 2
+                if s.garra_av && s.e1p2 {
+                    self.garra_desce = true;
+                    self.garra_sobe = false;
+                    self.garra_recuar = true;
+                    self.garra_avancar = false;
+                }
+                if s.garra_recolhida {
+                    self.passo_roletada = if self.passo_roletada == 200 { 201 } else { 205 };
+                }
+            }
+            201 => {
+                // Receber o segundo fardo da sequência
+                if s.esteira && !s.e1p1 && !s.pac1_prox_bloq {
+                    self.motor_roletada = true;
+                    self.bloqueio_entrada = false;
+                    self.passo_roletada = 202;
+                }
+                raise_if_back(self);
+            }
+            203 => {
+                // Aguardar fardos chegarem na posição e inicia movimento da garra
+                raise_if_back(self);
+                self.espera_pac_rol = s.pac1_prox_bloq || s.e1p1;
+                if s.e1p1 {
+                    self.espera_ent_pac_rol = true;
+                }
+                if s.garra_levantada && q_ent_pac_rol {
+                    self.motor_roletada = false;
+                    self.espera_pac_rol = false;
+                    self.espera_ent_pac_rol = false;
+                    self.garra_avancar = true;
+                    self.garra_recuar = false;
+                    self.passo_roletada = 204;
+                }
+            }
+            205 => {
+                // A pré-formadora pede dois fardos: envia
+                if self.solicitar_fardo {
+                    self.motor_preformadora = true;
+                    self.bloqueio_meio = false;
+                    self.motor_roletada = true;
+                    self.passo_roletada = 206;
+                }
+                raise_if_back(self);
+            }
+            300 => {
+                // Continuação do vetor de reset
+                if s.garra_levantada {
+                    self.garra_avancar = true;
+                    self.garra_recuar = false;
+                }
+                if s.garra_av && s.e1p2 && !s.e1p3 {
+                    self.garra_desce = true;
+                    self.garra_sobe = false;
+                    self.passo_roletada = 200;
+                } else if s.garra_av && s.e1p2 && s.e1p3 {
+                    self.garra_desce = true;
+                    self.garra_sobe = false;
+                    self.passo_roletada = 204;
+                }
+            }
             0 => {
                 // Vetor de reset (Fardo10Kg = 0)
                 self.garra_avancar = false;
@@ -653,6 +856,188 @@ impl PreForma3 {
         }
 
         match self.passo_preformadora {
+            0 if self.fardo_10kg => {
+                self.empurrador_avancar = false;
+                self.empurrador_recuar = true;
+                self.bloqueio_coleta = true;
+                self.passo_preformadora = 200;
+            }
+            100 | 110 => {
+                // Solicitar um fardo para a posição 1 (110: o último de um grupo de 4)
+                if self.passo_preformadora == 100 {
+                    self.bloqueio_coleta = true;
+                }
+                if s.emp_rec {
+                    self.solicitar_fardo_pac1 = true;
+                    if !self.bloqueio_meio {
+                        self.solicitar_fardo_pac1 = false;
+                        self.passo_preformadora += 1;
+                    }
+                }
+            }
+            101 => {
+                // Aguardar o recebimento do fardo
+                if s.e2p1 {
+                    self.espera_ent_pac_pre = true;
+                }
+                if q_ent_pre {
+                    self.motor_preformadora = false;
+                    self.solicitar_fardo_pac1 = false;
+                    self.espera_ent_pac_pre = false;
+                    self.passo_preformadora = 102;
+                }
+            }
+            102 | 202 => {
+                // Empurra o fardo até o batente físico
+                self.empurrador_avancar = true;
+                self.empurrador_recuar = false;
+                if s.e2p2 {
+                    self.espera_pressao = true;
+                }
+                if self.passo_preformadora == 102 {
+                    self.solicitar_fardo = !s.e1p2 && !s.e1p3;
+                }
+                if q_pressao {
+                    self.espera_pressao = false;
+                    if self.passo_preformadora == 102 {
+                        self.passo_preformadora = 103;
+                    } else {
+                        self.empurrador_avancar = false;
+                        self.passo_preformadora = 105;
+                    }
+                }
+            }
+            103 => {
+                // Alivia o cilindro e pede os dois fardos da roletada
+                self.empurrador_avancar = false;
+                self.empurrador_recuar = false;
+                self.solicitar_fardo = true;
+                if !self.bloqueio_meio {
+                    self.solicitar_fardo = false;
+                    self.solicitar_fardo_pac1 = false;
+                    self.passo_preformadora = 104;
+                }
+            }
+            104 => {
+                // Aguarda os fardos chegarem na posição
+                if s.e2p3 {
+                    self.espera_ent_pac_pre = true;
+                }
+                if q_ent_pre {
+                    self.motor_preformadora = false;
+                    self.solicitar_fardo_pac1 = false;
+                    self.espera_ent_pac_pre = false;
+                    self.passo_preformadora = 105;
+                }
+            }
+            105 => {
+                // Aguarda a coleta: quantos fardos precisa nesse ponto (PalletOK, linha livre)
+                if coleta_pronta_receber && self.fardos_ponto == 3 {
+                    self.passo_preformadora = 106;
+                    self.empurrador_avancar = false;
+                    self.empurrador_recuar = true;
+                }
+                if coleta_pronta_receber && self.fardos_ponto == 4 {
+                    self.passo_preformadora = 110;
+                    self.empurrador_avancar = false;
+                    self.empurrador_recuar = true;
+                }
+            }
+            106 => {
+                // Envia o grupo para a coleta
+                self.passo_preformadora = 107;
+                self.bloqueio_coleta = false;
+                self.antecipada_transferindo = true;
+                self.motor_preformadora = true;
+                self.espera_simul_pre_col = false;
+            }
+            107 => {
+                // Aguarda receber sinal que foi recebido
+                if !s.e2p1 && !s.e2p2 && !s.e2p3 {
+                    self.espera_simul_pre_col = true;
+                }
+                if coleta_recebido {
+                    self.antecipada_transferindo = false;
+                    self.bloqueio_coleta = true;
+                    self.motor_preformadora = false;
+                    self.passo_preformadora = 100;
+                }
+                if q_simul_pre_col && self.passo_preformadora == 107 {
+                    self.passo_preformadora = 120;
+                    self.solicitar_fardo_pac1 = true;
+                }
+            }
+            111 => {
+                // Aguardar o último fardo e enviar para a coleta
+                if s.e2p1 && s.e2p2 {
+                    self.espera_ent_pac_pre = true;
+                    self.solicitar_fardo_pac1 = false;
+                } else {
+                    self.solicitar_fardo_pac1 = true;
+                }
+                if q_ent_pre {
+                    self.motor_preformadora = false;
+                    self.espera_ent_pac_pre = false;
+                    self.passo_preformadora = 106;
+                }
+            }
+            120 => {
+                // Monitora se enviou os fardos e recebeu o novo fardo
+                self.espera_simul_pre_col = false;
+                if coleta_recebido {
+                    self.bloqueio_coleta = true;
+                    self.antecipada_transferindo = false;
+                }
+                if !self.bloqueio_meio {
+                    self.solicitar_fardo_pac1 = false;
+                }
+                if s.e2p1 {
+                    self.espera_ent_pac_pre = true;
+                }
+                if !self.antecipada_transferindo && !self.solicitar_fardo_pac1 && self.espera_ent_pac_pre {
+                    self.passo_preformadora = 101;
+                }
+                if self.bloqueio_meio {
+                    self.antecipada_transferindo = false;
+                    self.bloqueio_coleta = true;
+                    self.motor_preformadora = false;
+                    self.passo_preformadora = 100;
+                }
+            }
+            200 => {
+                // Inicializar a formadora 10 kg após o reset
+                if s.emp_rec && (s.e2p1 || s.e2p2) {
+                    self.passo_preformadora = 201;
+                    self.empurrador_avancar = true;
+                    self.empurrador_recuar = false;
+                }
+                if s.emp_rec && !s.e2p1 && !s.e2p2 {
+                    self.passo_preformadora = 100;
+                }
+            }
+            201 => {
+                // Aguarda cilindro avançar
+                if s.e2p2 && !s.emp_rec {
+                    self.espera_pressao = true;
+                }
+                if q_pressao {
+                    self.empurrador_avancar = false;
+                    self.empurrador_recuar = true;
+                    if s.emp_rec {
+                        if !s.e2p3 && s.e2p2 && !s.e2p1 {
+                            self.espera_pressao = false;
+                            self.passo_preformadora = 102;
+                        }
+                        if s.e2p2 && s.e2p3 && !s.e2p1 {
+                            self.espera_pressao = false;
+                            self.passo_preformadora = 202;
+                        }
+                        if s.e2p1 && s.e2p2 && s.e2p3 && self.fardos_ponto == 4 && coleta_pronta_receber {
+                            self.passo_preformadora = 106;
+                        }
+                    }
+                }
+            }
             0 => {
                 self.empurrador_avancar = false;
                 self.empurrador_recuar = true;
@@ -769,6 +1154,8 @@ pub struct MesaLogic {
     pub robot_collected: bool,
     /// Set by the robot when the pallet needs one last product (última camada ímpar).
     pub single_request: bool,
+    /// Mesa 3 estágios, receita 10x1: fardos the next group needs (FardosPonto, 3 or 4).
+    pub fardos_ponto: u32,
 }
 
 impl MesaLogic {
@@ -778,7 +1165,7 @@ impl MesaLogic {
             EquipmentKind::Table3Stage => MesaProgram::PreForma(PreForma3::default()),
             _ => return None,
         };
-        Some(Self { program, coleta: Coleta::default(), robot_collected: false, single_request: false })
+        Some(Self { program, coleta: Coleta::default(), robot_collected: false, single_request: false, fardos_ponto: 3 })
     }
 
     pub fn status(&self) -> String {
@@ -857,6 +1244,8 @@ pub fn run_mesas(time: Res<Time>, control: Res<SimControl>, mut mesas: Query<(&E
                     e2p3: io.get_bool("SensorEtapa2Pac3"),
                     emp_rec: io.get_bool("SensorEmpurradorRec"),
                 };
+                p.fardo_10kg = eq.params.fardo_10kg;
+                p.fardos_ponto = logic.fardos_ponto;
                 p.tick(&s, pronto, recebido, dt);
                 drive(&mut io, "Motor", p.motor());
                 drive(&mut io, "BloqueioEntrada", p.bloqueio_entrada);

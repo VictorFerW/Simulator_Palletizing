@@ -130,6 +130,16 @@ Ao gerar o formato, a tela calcula a sequência de pegas. As vistas mostram o n�
 
 No depósito simples o giro do punho é exato (só voltas inteiras, dentro de ±360° do J4), porque meia volta colocaria o outro produto na posição. As pinças encostam os dois fardos do par um no outro ao fechar. Com `PDT_TRACE`, o simulador informa qual pinça abre em cada depósito e avisa se um fardo da garra encostar num fardo do pallet.
 
+### Receita 10x1 (mesa 3 estágios)
+
+Na mesa 3 estágios, a opção **Receita 10x1** (o `Fardo10Kg` do FB) troca a lógica normal pela do 10x1, portada dos passos 100–300 da roletada e 100–202 da pré-formadora. A mesa passa a ter quatro posições lado a lado, da pista de entrada até o batente físico da pré-formadora:
+
+1. **Roletada:** entra um fardo. Se a pré-formadora pede um, ele segue direto. Se pede dois, a garra empurra a fileira, entra outro, a garra empurra de novo e os dois seguem.
+2. **Pré-formadora:** o primeiro fardo vai até o batente pelo empurrador; o cilindro alivia e chegam os dois da roletada, formando um grupo de 3.
+3. **Coleta:** conforme a pega do robô (`FardosPonto`), a pré-formadora manda os 3 para a coleta, ou recebe mais um fardo reto e manda 4.
+
+Na tela de padrões, marque **receita 10x1** no cabeçote. As pegas passam a seguir o ciclo **4 → 3 → 3**: o robô pega os 4 e deposita 2 numa ponta e 2 na outra (abre um lado do cabeçote de cada vez), depois deposita os 3 de uma vez, e de novo 3. A tela põe primeiro os formatos que fecham esse ciclo, como 10 por camada em 2 fileiras de 5 com o fardo atravessado, e avisa quando um formato não fecha. O robô avisa a mesa quantos fardos a próxima pega precisa. Se chegar um número diferente, ele deposita os fardos um a um nas próximas posições.
+
 Cada formato mostra unidades por camada, camadas e total, altura e peso (e qual limite parou as camadas), a ocupação da área do pallet, a sobra e se as camadas são amarradas. Para o TDP escolhido, a tela mostra a altura do topo do pallet completo e avisa quando ela passa do alcance do robô com o cabeçote. **Aplicar ao TDP de paletização** grava o formato e as camadas no TDP (e no layout salvo), e o robô passa a seguir a ordem e a orientação do formato. **Usar automático** volta à grade simples.
 
 ## Carro cheio giratório (CCH)

@@ -42,6 +42,10 @@ pub struct Pattern {
     /// Picks of the robot: each pick is a list of drops, each drop the slots it fills.
     #[serde(default)]
     pub picks: Vec<Vec<Vec<u32>>>,
+    /// Groups the mesa forms, repeated (receita 10x1: [[2, 2], [3], [3]] = 4 fardos placed
+    /// 2 + 2 at the two ends, then 3 and 3). Empty: pairs and singles of `per_pick`.
+    #[serde(default)]
+    pub groups: Vec<Vec<u32>>,
 }
 
 fn one() -> u32 {
@@ -64,19 +68,6 @@ impl Pattern {
 
     pub fn layer(&self, layer: u32) -> &[[f32; 3]] {
         if layer.is_multiple_of(2) { &self.odd } else { &self.even }
-    }
-
-    /// Layer and position of a slot.
-    pub fn locate(&self, index: u32) -> Option<(u32, usize)> {
-        let mut remaining = index as usize;
-        for layer in 0..self.layers {
-            let n = self.layer(layer).len();
-            if remaining < n {
-                return Some((layer, remaining));
-            }
-            remaining -= n;
-        }
-        None
     }
 
     /// Two positions of a layer the cabeçote can fill in one drop: same orientation,
@@ -118,11 +109,102 @@ fn matching(p: &Pattern, places: &[[f32; 3]], set: &[usize]) -> Vec<(usize, usiz
     pairs
 }
 
+/// Straight runs of `k` side-by-side positions among `left` (k = 1: each position).
+fn chains(p: &Pattern, places: &[[f32; 3]], left: &[usize], k: usize) -> Vec<Vec<usize>> {
+    if k <= 1 {
+        return left.iter().map(|&i| vec![i]).collect();
+    }
+    let mut out = Vec::new();
+    for &a in left {
+        for &b in left {
+            if a == b || !p.pairable(&places[a], &places[b]) {
+                continue;
+            }
+            let step = Vec2::new(places[b][0] - places[a][0], places[b][1] - places[a][1]);
+            let mut run = vec![a, b];
+            while run.len() < k {
+                let last = places[*run.last().unwrap()];
+                let next = left.iter().copied().find(|&c| {
+                    !run.contains(&c)
+                        && p.pairable(&last, &places[c])
+                        && (Vec2::new(places[c][0] - last[0], places[c][1] - last[1]) - step).length() < 0.03
+                });
+                match next {
+                    Some(c) => run.push(c),
+                    None => break,
+                }
+            }
+            if run.len() == k {
+                out.push(run);
+            }
+        }
+    }
+    out
+}
+
+/// Positions of `left` with no side-by-side neighbour left (they could only be placed alone).
+fn isolated(p: &Pattern, places: &[[f32; 3]], left: &[usize]) -> usize {
+    left.iter().filter(|&&i| !left.iter().any(|&j| j != i && p.pairable(&places[i], &places[j]))).count()
+}
+
+/// Pick sequence for the groups of the mesa (`p.groups`, repeated): each drop is a
+/// straight run of side-by-side positions, chosen at the ends of the rows so the rest
+/// still forms runs (the 2 + 2 of a group of 4 go to the two ends). A layer that does
+/// not fit the groups takes the rest one by one.
+fn plan_groups(p: &Pattern) -> Vec<Vec<Vec<u32>>> {
+    let mut picks = Vec::new();
+    let mut cycle = 0;
+    let mut offset = 0u32;
+    for layer in 0..p.layers {
+        let places = p.layer(layer);
+        let mut left: Vec<usize> = (0..places.len()).collect();
+        while !left.is_empty() {
+            let spec = &p.groups[cycle % p.groups.len()];
+            cycle += 1;
+            let mut trial = left.clone();
+            let mut drops: Vec<Vec<u32>> = Vec::new();
+            for &k in spec {
+                let best = chains(p, places, &trial, k as usize).into_iter().min_by_key(|run| {
+                    let rest: Vec<usize> = trial.iter().copied().filter(|i| !run.contains(i)).collect();
+                    let degree: usize = run
+                        .iter()
+                        .map(|&i| trial.iter().filter(|&&j| j != i && p.pairable(&places[i], &places[j])).count())
+                        .sum();
+                    (isolated(p, places, &rest), degree)
+                });
+                match best {
+                    Some(run) => {
+                        trial.retain(|i| !run.contains(i));
+                        drops.push(run.iter().map(|&i| offset + i as u32).collect());
+                    }
+                    None => {
+                        drops.clear();
+                        break;
+                    }
+                }
+            }
+            if drops.is_empty() {
+                // Does not fit the group: the rest of the layer one at a time.
+                let n = (spec.iter().sum::<u32>() as usize).min(left.len());
+                drops = left.drain(..n).map(|i| vec![offset + i as u32]).collect();
+            } else {
+                left = trial;
+            }
+            picks.push(drops);
+        }
+        offset += places.len() as u32;
+    }
+    picks
+}
+
 /// Pick sequence of the robot (see the module comment): on each layer, first two
 /// positions that cannot pair (two simple drops), then the pairs; a position left
 /// alone goes with the first simple drop of the next layer; the last one alone is
 /// a single-product pick.
 pub fn plan_picks(p: &Pattern) -> Vec<Vec<Vec<u32>>> {
+    if !p.groups.is_empty() {
+        return plan_groups(p);
+    }
     let mut picks: Vec<Vec<Vec<u32>>> = Vec::new();
     let mut open: Option<Vec<Vec<u32>>> = None;
     let mut offset = 0u32;
@@ -207,6 +289,8 @@ pub struct PatternInput {
     pub pick_gap: f32,
     /// Products of a pick in line along their length (else side by side across their width).
     pub pick_in_line: bool,
+    /// Mesa 3 estágios receita 10x1: groups of 4 (placed 2 + 2) and 3, 3.
+    pub recipe_10x1: bool,
     pub pallet: [f32; 3],
     pub overhang: f32,
     pub gap: f32,
@@ -223,6 +307,7 @@ impl Default for PatternInput {
             per_pick: 2,
             pick_gap: 20.0,
             pick_in_line: false,
+            recipe_10x1: false,
             pallet: [1000.0, 1200.0, 144.0],
             overhang: 0.0,
             gap: 0.0,
@@ -269,6 +354,8 @@ pub struct Candidate {
     pub height: f32,
     pub kg: f32,
     pub interlocked: bool,
+    /// Every pick matches the groups of the mesa (receita 10x1: 4 = 2 + 2, 3, 3).
+    pub fits_groups: bool,
     /// Layers limited by: altura, peso or the requested count.
     pub limit: &'static str,
 }
@@ -434,9 +521,15 @@ pub fn generate(input: &PatternInput) -> Vec<Candidate> {
 
     let col_a = block(0.0, 0.0, fit(w, a, g), fit(d, b, g), false, ab);
     let col_b = block(0.0, 0.0, fit(w, b, g), fit(d, a, g), true, ab);
-    let column = if col_b.len() > col_a.len() { col_b.clone() } else { col_a.clone() };
-    if !column.is_empty() {
-        let column = centre(column, (a, b));
+    // Both orientations of the column (the one with fewer may be the recipe, e.g. 10x1 in 5 x 2).
+    for (name, column) in [("Coluna", &col_a), ("Coluna (produto atravessado)", &col_b)] {
+        if !column.is_empty() && col_a.len() != col_b.len() {
+            let column = centre(column.clone(), (a, b));
+            layers_options.push((name.into(), column.clone(), column, false));
+        }
+    }
+    if !col_a.is_empty() && col_a.len() == col_b.len() {
+        let column = centre(col_a.clone(), (a, b));
         layers_options.push(("Coluna".into(), column.clone(), column, false));
     }
     if !col_a.is_empty() && col_a.len() == col_b.len() {
@@ -487,6 +580,7 @@ pub fn generate(input: &PatternInput) -> Vec<Candidate> {
                 height: input.pallet[2] + layers as f32 * unit[1],
                 kg: layers as f32 * layer_kg,
                 interlocked,
+                fits_groups: true,
                 limit,
                 pattern: {
                     let mut pattern = Pattern {
@@ -495,10 +589,11 @@ pub fn generate(input: &PatternInput) -> Vec<Candidate> {
                         layers,
                         odd,
                         even,
-                        per_pick: input.per_pick.clamp(1, 2),
+                        per_pick: if input.recipe_10x1 { 4 } else { input.per_pick.clamp(1, 2) },
                         pick_gap: mm(input.pick_gap),
                         pick_in_line: input.pick_in_line,
                         picks: Vec::new(),
+                        groups: if input.recipe_10x1 { vec![vec![2, 2], vec![3], vec![3]] } else { Vec::new() },
                     };
                     pattern.picks = plan_picks(&pattern);
                     pattern
@@ -506,7 +601,17 @@ pub fn generate(input: &PatternInput) -> Vec<Candidate> {
             }
         })
         .collect();
-    out.sort_by(|x, y| y.total.cmp(&x.total).then(y.interlocked.cmp(&x.interlocked)));
+    for c in &mut out {
+        let g = &c.pattern.groups;
+        c.fits_groups = g.is_empty()
+            || c.pattern.picks.iter().enumerate().all(|(i, pick)| {
+                let sizes: Vec<u32> = pick.iter().map(|d| d.len() as u32).collect();
+                sizes == g[i % g.len()]
+            });
+    }
+    out.sort_by(|x, y| {
+        y.fits_groups.cmp(&x.fits_groups).then(y.total.cmp(&x.total)).then(y.interlocked.cmp(&x.interlocked))
+    });
     out
 }
 
@@ -619,6 +724,7 @@ pub fn pattern_window(
                 state.input.product = [bx[0] * 1000.0, bx[2] * 1000.0, bx[1] * 1000.0];
                 state.input.per_pick = 2;
                 state.input.layers = 3;
+                state.input.recipe_10x1 = std::env::var("PDT_PATTERN").is_ok_and(|v| v == "apply10x1");
             }
             let input = &mut state.input;
             ui.columns(2, |cols| {
@@ -654,8 +760,15 @@ pub fn pattern_window(
                     });
                     ui.end_row();
                     mm_field(ui, "Folga na pega", &mut input.pick_gap, 200.0, " mm");
+                    ui.label("Mesa 3 estágios");
+                    ui.checkbox(&mut input.recipe_10x1, "receita 10x1 (pegas de 4 e 3)").on_hover_text(
+                        "A mesa forma 4 fardos lado a lado (o robô deposita 2 numa ponta e 2 na outra), depois 3 e 3",
+                    );
+                    ui.end_row();
                     ui.label("Por pega");
-                    ui.strong(if input.per_pick >= 2 {
+                    ui.strong(if input.recipe_10x1 {
+                        "4 (2 + 2 nas pontas), 3, 3"
+                    } else if input.per_pick >= 2 {
                         "2 produtos (par ou dois depósitos simples)"
                     } else {
                         "1 produto"
@@ -731,11 +844,22 @@ pub fn pattern_window(
                                 let picks = &c.pattern.picks;
                                 let pairs = picks.iter().filter(|k| k.len() == 1 && k[0].len() == 2).count();
                                 let singles = picks.iter().filter(|k| k.len() == 2).count();
-                                let mut text = format!("{} pegas: {} em par, {} com dois depósitos", picks.len(), pairs, singles);
+                                let mut text = if c.pattern.groups.is_empty() {
+                                    format!("{} pegas: {} em par, {} com dois depósitos", picks.len(), pairs, singles)
+                                } else {
+                                    let sizes: Vec<String> = picks.iter().take(6).map(|k| k.iter().map(|d| d.len().to_string()).collect::<Vec<_>>().join("+")).collect();
+                                    format!("{} pegas ({}…)", picks.len(), sizes.join(", "))
+                                };
                                 if picks.last().is_some_and(|k| k.iter().flatten().count() == 1) {
                                     text.push_str(", última com 1 produto");
                                 }
                                 ui.label(text).on_hover_text("Número = pega do robô; a/b = depósitos da mesma pega (abre um lado da garra por vez)");
+                                if !c.fits_groups {
+                                    ui.colored_label(
+                                        egui::Color32::from_rgb(230, 120, 60),
+                                        "Não fecha as pegas da mesa (4 = 2 + 2, 3, 3): sobram fardos colocados um a um",
+                                    );
+                                }
                                 if c.overhang > 0.5 {
                                     ui.label(format!("Sobra máxima {:.0} mm por lado", c.overhang));
                                 }
@@ -913,6 +1037,30 @@ mod tests {
         let mut all: Vec<u32> = c.pattern.sequence();
         all.sort();
         assert_eq!(all, (0..15).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn recipe_10x1_groups() {
+        // 10 per layer (two rows of 5 side by side): 4 = 2 + 2 at the ends, then 3 and 3.
+        let input = PatternInput {
+            product: [500.0, 200.0, 110.0],
+            pallet: [1000.0, 1200.0, 144.0],
+            recipe_10x1: true,
+            layers: 2,
+            ..default()
+        };
+        let c = generate(&input).into_iter().next().expect("formato");
+        assert!(c.fits_groups && c.per_layer == 10, "{} {}", c.pattern.name, c.per_layer);
+        let picks = &c.pattern.picks;
+        assert_eq!(picks.len(), 6, "{picks:?}");
+        for (i, pick) in picks.iter().enumerate() {
+            let sizes: Vec<usize> = pick.iter().map(|d| d.len()).collect();
+            let expected: &[usize] = if i % 3 == 0 { &[2, 2] } else { &[3] };
+            assert_eq!(sizes, expected, "{picks:?}");
+        }
+        let mut all = c.pattern.sequence();
+        all.sort();
+        assert_eq!(all, (0..20).collect::<Vec<_>>());
     }
 
     #[test]

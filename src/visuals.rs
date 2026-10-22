@@ -81,19 +81,12 @@ impl FromWorld for Palette {
             alpha_mode: AlphaMode::Blend,
             ..default()
         });
-        let pedestal = materials.add(StandardMaterial {
-            base_color: Color::srgb(0.25, 0.27, 0.30),
-            metallic: 0.3,
-            perceptual_roughness: 0.6,
-            ..default()
-        });
         let cad_files_present = robot::CadPart::ALL
             .iter()
             .all(|(_, file)| asset_root().join(ROBOT_CAD_DIR).join(format!("{file}.glb")).exists());
         let part_materials: Vec<Handle<StandardMaterial>> = robot::CadPart::ALL
             .iter()
             .map(|(part, file)| match (part, *file) {
-                (robot::CadPart::Base, _) => pedestal.clone(),
                 (robot::CadPart::LevelRod | robot::CadPart::LevelLink | robot::CadPart::LeverRod, _) => steel.clone(),
                 (robot::CadPart::Flange, _) => dark.clone(),
                 _ => fanuc_yellow.clone(),

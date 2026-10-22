@@ -73,6 +73,9 @@ pub struct Pusher {
     /// Vertical motion of a comb: (raise, lower, sensor raised, sensor lowered).
     pub lift: Option<(&'static str, &'static str, &'static str, &'static str)>,
     pub comb: bool,
+    /// The comb lifts the whole row ahead of it (receita 10x1: each push moves every
+    /// fardo already pushed one more lane).
+    pub train: bool,
 }
 
 #[derive(Default)]
@@ -88,8 +91,25 @@ pub struct ConveyorLayout {
 /// Lateral position (local Z) of the two product lanes of a mesa: the entry lane
 /// (posição 1, where fardos arrive) and the pushed lane (posição 2).
 pub fn mesa_lanes(eq: &Equipment) -> (f32, f32) {
+    if is_10x1(eq) {
+        let lanes = lanes_10x1(eq);
+        return (lanes[3], lanes[2]);
+    }
     let bw = eq.params.box_size[2];
     (bw / 2.0 + 0.01, -bw / 2.0 - 0.01)
+}
+
+pub fn is_10x1(eq: &Equipment) -> bool {
+    eq.kind == EquipmentKind::Table3Stage && eq.params.fardo_10kg
+}
+
+/// Receita 10x1 of the mesa 3 estágios: four lanes side by side, from the physical
+/// stop of the pré-formadora (lane 0, far side) to the entry lane (lane 3).
+pub fn lanes_10x1(eq: &Equipment) -> [f32; 4] {
+    let bw = eq.params.box_size[2];
+    let pitch = bw + 0.02;
+    let stop = -eq.params.width / 2.0 + bw / 2.0 + 0.005;
+    [stop, stop + pitch, stop + 2.0 * pitch, stop + 3.0 * pitch]
 }
 
 pub fn layout(eq: &Equipment) -> ConveyorLayout {
@@ -172,7 +192,71 @@ pub fn layout(eq: &Equipment) -> ConveyorLayout {
                     sensor_retracted: "Sensor_EmpurradorRc",
                     lift: None,
                     comb: false,
+                    train: false,
                 }],
+                pick_x0: Some(x_col),
+            }
+        }
+        EquipmentKind::Table3Stage if is_10x1(eq) => {
+            // Receita 10x1: the garra pushes the row one lane per stroke (entry lane 3
+            // to lanes 2 and 1); the empurrador takes a fardo from the entry lane to the
+            // stop (lane 0); groups of 3 (lanes 0..2) or 4 (0..3) go to the coleta.
+            let x_mid = x_start + l / 3.0;
+            let x_col = x_start + 2.0 * l / 3.0;
+            let lane = lanes_10x1(eq);
+            let beam = |key: &'static str, x: f32, z: f32| PhotoSensor { key, x, z0: z - 0.05, z1: z + 0.05 };
+            ConveyorLayout {
+                segments: vec![
+                    Segment { x0: x_start, x1: x_mid, motor: "Motor" },
+                    Segment { x0: x_mid, x1: x_col, motor: "Motor" },
+                    Segment { x0: x_col, x1: x_end, motor: "Motor_Coleta" },
+                ],
+                barriers: vec![
+                    Barrier { x: x_start, key: "BloqueioEntrada" },
+                    Barrier { x: x_mid, key: "BloqueioMeio" },
+                    Barrier { x: x_col, key: "BloqueioColeta" },
+                    Barrier { x: x_end, key: "Batente_Coleta" },
+                ],
+                sensors: vec![
+                    beam("SensorEsteira", x_start - 0.5, lane[3]),
+                    beam("SensorEtapa1Pac1ProxBloq", x_start + 0.15, lane[3]),
+                    beam("SensorEtapa1Pac1", x_mid - 0.08, lane[3]),
+                    beam("SensorEtapa1Pac2", x_mid - 0.08, lane[2]),
+                    beam("SensorEtapa1Pac3", x_mid - 0.08, lane[1]),
+                    beam("SensorEtapa2Pac1", x_col - 0.08, lane[3]),
+                    beam("SensorEtapa2Pac2", x_col - 0.08, lane[0]),
+                    beam("SensorEtapa2Pac3", x_col - 0.08, lane[1]),
+                    beam("Sensor_Coleta1", x_end - 0.08, lane[1]),
+                    beam("Sensor_Coleta2", x_end - 0.08, lane[0]),
+                ],
+                pushers: vec![
+                    Pusher {
+                        x0: x_mid - bl - 0.04,
+                        x1: x_mid - 0.01,
+                        face_start: lane[3],
+                        face_end: lane[2],
+                        advance: "GarraAvancar",
+                        retract: "GarraRecuar",
+                        sensor_advanced: "SensorGarraAv",
+                        sensor_retracted: "SensorGarraRec",
+                        lift: Some(("GarraSobe", "GarraDesce", "SensorGarraLevantada", "SensorGarraRecolhida")),
+                        comb: true,
+                        train: true,
+                    },
+                    Pusher {
+                        x0: x_col - bl - 0.04,
+                        x1: x_col - 0.01,
+                        face_start: w / 2.0,
+                        face_end: lane[0] + p.box_size[2] / 2.0,
+                        advance: "EmpurradorAvancar",
+                        retract: "EmpurradorRecuar",
+                        sensor_advanced: "SensorEmpurradorAv",
+                        sensor_retracted: "SensorEmpurradorRec",
+                        lift: None,
+                        comb: false,
+                        train: false,
+                    },
+                ],
                 pick_x0: Some(x_col),
             }
         }
@@ -218,6 +302,7 @@ pub fn layout(eq: &Equipment) -> ConveyorLayout {
                         sensor_retracted: "SensorGarraRec",
                         lift: Some(("GarraSobe", "GarraDesce", "SensorGarraLevantada", "SensorGarraRecolhida")),
                         comb: true,
+                        train: false,
                     },
                     Pusher {
                         x0: x_col - bl - 0.04,
@@ -230,6 +315,7 @@ pub fn layout(eq: &Equipment) -> ConveyorLayout {
                         sensor_retracted: "SensorEmpurradorRec",
                         lift: None,
                         comb: false,
+                        train: false,
                     },
                 ],
                 pick_x0: Some(x_col),

@@ -162,10 +162,11 @@ fn setup_scene(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>, palette
         Camera3d::default(),
         Transform::from_xyz(8.0, 7.0, 10.0).looking_at(Vec3::ZERO, Vec3::Y),
         OrbitCamera {
-            target: Vec3::new(-1.0, 0.8, 0.8),
-            radius: 12.0,
-            yaw: 0.9,
-            pitch: 0.55,
+            target: Vec3::new(-0.8, 0.5, -1.2),
+            radius: 21.0,
+            // From the bottom of the drawing: lines on the left, TDP rows on the right.
+            yaw: std::f32::consts::FRAC_PI_2,
+            pitch: 1.0,
         },
     ));
     commands.spawn((

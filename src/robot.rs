@@ -144,9 +144,10 @@ mod rest {
 }
 
 /// Parts of the manufacturer's model (`assets/models/fanuc_m410ic185/*.glb`).
+/// The pedestal (S201) and its floor plate are left out: only the robot is drawn,
+/// from the J1 turntable up (the kinematics keep J2 at 1110 mm).
 #[derive(Component, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum CadPart {
-    Base,
     Turntable,
     LowerArm,
     Lever,
@@ -160,9 +161,7 @@ pub enum CadPart {
 }
 
 impl CadPart {
-    pub const ALL: [(Self, &'static str); 12] = [
-        (Self::Base, "S201"),
-        (Self::Base, "Base_plate"),
+    pub const ALL: [(Self, &'static str); 10] = [
         (Self::Turntable, "S301"),
         (Self::LowerArm, "S302"),
         (Self::Lever, "S303"),
@@ -188,7 +187,7 @@ impl CadPart {
             Affine3A::from_translation(new_pivot) * Affine3A::from_rotation_z(angle) * Affine3A::from_translation(-pivot)
         };
         let arm = match self {
-            Self::Base | Self::Turntable => Affine3A::IDENTITY,
+            Self::Turntable => Affine3A::IDENTITY,
             Self::LowerArm => about(j2, j2, a),
             Self::Lever => about(j2, j2, b),
             Self::LeverRod => {
@@ -208,7 +207,7 @@ impl CadPart {
                 Affine3A::from_translation(axis + dw) * Affine3A::from_rotation_y(flange_yaw) * Affine3A::from_translation(-axis)
             }
         };
-        let full = if self == Self::Base { arm } else { Affine3A::from_rotation_y(joints.j1) * arm };
+        let full = Affine3A::from_rotation_y(joints.j1) * arm;
         Transform::from_matrix(Mat4::from(full))
     }
 }
@@ -563,7 +562,8 @@ struct Plan {
     safe_y: f32,
     above: Pose,
     /// Products still missing on the pallet after this pick (with a pattern).
-    remaining_after: Option<usize>,
+    /// Products of the next pick (with a pattern): the mesa prepares that group.
+    next_size: Option<usize>,
 }
 
 /// Footprint overlap area of two products (yaw multiples of 90°).
@@ -583,79 +583,107 @@ fn aligned(a: f32, b: f32) -> bool {
     !(0.05..=PI - 0.05).contains(&d)
 }
 
-/// Drops for the next slots of a pattern: both products at once when the two slots
-/// are a pair for the cabeçote, else one clamp at a time, turning the group so the
-/// product still held does not land on products already placed.
-fn pattern_drops(p: &crate::pattern::Pattern, pallet_h: f32, held: &[HeldBox], todo: &[u32], filled: &[u32], dy: f32) -> Vec<Drop> {
+/// Current pick of the pattern: its drops with the slots still to fill, and the
+/// number of products of the pick after it (the next pallet starts over).
+fn current_pick(p: &crate::pattern::Pattern, filled: &[u32]) -> Option<(Vec<Vec<u32>>, usize)> {
+    let fallback: Vec<Vec<Vec<u32>>>;
+    let picks = if p.picks.is_empty() {
+        let seq = p.sequence();
+        fallback = seq.chunks(p.per_pick.max(1) as usize).map(|c| c.iter().map(|&s| vec![s]).collect()).collect();
+        &fallback
+    } else {
+        &p.picks
+    };
+    let i = picks.iter().position(|k| k.iter().flatten().any(|s| !filled.contains(s)))?;
+    let drops: Vec<Vec<u32>> = picks[i]
+        .iter()
+        .map(|d| d.iter().copied().filter(|s| !filled.contains(s)).collect::<Vec<_>>())
+        .filter(|d| !d.is_empty())
+        .collect();
+    let next = picks.get(i + 1).unwrap_or(&picks[0]).iter().flatten().count();
+    Some((drops, next))
+}
+
+/// Drops of the current pick: each drop lets go of the fardos on one side of the
+/// cabeçote (the lowest or highest along the group Z: a pair, a run of 3, one
+/// fardo...) onto a run of side-by-side slots. The group turns (exactly, a half
+/// turn would swap the sides) so the fardos still held do not land on products
+/// already placed. With a different number of fardos than the pick, they go one by
+/// one onto the next slots.
+fn pattern_drops(p: &crate::pattern::Pattern, pallet_h: f32, held: &[HeldBox], spec: &[Vec<u32>], filled: &[u32], dy: f32) -> Vec<Drop> {
     let h = held.iter().map(|b| b.height).fold(0.0, f32::max);
     let place = |slot: u32| p.slot(pallet_h, h, slot).map(|(c, yaw)| (c + Vec3::Y * dy, yaw));
-    let slots: Vec<u32> = todo.iter().copied().take(held.len()).collect();
-    if held.len() == 2
-        && slots.len() == 2
-        && let (Some((a, ya)), Some((b, yb))) = (place(slots[0]), place(slots[1]))
-        && let (Some((la, ia)), Some((lb, ib))) = (p.locate(slots[0]), p.locate(slots[1]))
-        && la == lb
-        && p.pairable(&p.layer(la)[ia], &p.layer(lb)[ib])
-    {
-        // The box with the smaller offset along the group Z goes to `a`.
-        let (lo, hi) = if held[0].offset.z <= held[1].offset.z { (0, 1) } else { (1, 0) };
-        let d = b - a;
-        let gamma = d.x.atan2(d.z);
-        if aligned(gamma + held[lo].rel_yaw, ya) && aligned(gamma + held[hi].rel_yaw, yb) {
-            let mid = (a + b) / 2.0;
-            return vec![Drop {
-                boxes: vec![(held[lo].entity, a, ya), (held[hi].entity, b, yb)],
-                top: Vec3::new(mid.x, a.y - h / 2.0, mid.z),
-                yaw: gamma,
-                slots,
-                units: 2,
-                exact: true,
-            }];
-        }
-    }
+    let needed: usize = spec.iter().map(|d| d.len()).sum();
+    let spec: Vec<Vec<u32>> = if needed == held.len() {
+        spec.to_vec()
+    } else {
+        spec.iter().flatten().take(held.len()).map(|&s| vec![s]).collect()
+    };
     let size = Vec3::from_array(p.unit);
     let mut occupied: Vec<(Vec3, f32)> = filled.iter().filter_map(|&s| place(s)).collect();
     let mut remaining: Vec<usize> = (0..held.len()).collect();
+    remaining.sort_by(|&a, &b| held[a].offset.z.total_cmp(&held[b].offset.z));
     let mut drops = Vec::new();
-    for &slot in &slots {
-        let Some((pos, yaw)) = place(slot) else { continue };
-        let mut best: Option<(f32, usize, f32)> = None;
-        for &k in &remaining {
-            for turn in [0.0, PI] {
-                let gamma = yaw - held[k].rel_yaw + turn;
+    for slots in &spec {
+        let k = slots.len();
+        let Some(spots) = slots.iter().map(|&s| place(s)).collect::<Option<Vec<_>>>() else { break };
+        if k > remaining.len() {
+            break;
+        }
+        let mut subsets = vec![remaining[..k].to_vec()];
+        if k < remaining.len() {
+            subsets.push(remaining[remaining.len() - k..].to_vec());
+        }
+        let mut best: Option<(f32, Vec<usize>, Vec<usize>, f32)> = None;
+        for subset in &subsets {
+            for reverse in [false, true] {
+                // Slot order for the boxes of the subset (ascending along the group Z).
+                let order: Vec<usize> = if reverse { (0..k).rev().collect() } else { (0..k).collect() };
+                let gamma = if k >= 2 {
+                    let d = spots[order[k - 1]].0 - spots[order[0]].0;
+                    d.x.atan2(d.z)
+                } else {
+                    spots[0].1 - held[subset[0]].rel_yaw + if reverse { PI } else { 0.0 }
+                };
                 let rot = Quat::from_rotation_y(gamma);
-                let centre = pos - rot * Vec3::new(held[k].offset.x, 0.0, held[k].offset.z);
-                let score: f32 = remaining
-                    .iter()
-                    .filter(|&&j| j != k)
-                    .map(|&j| {
-                        let other = centre + rot * Vec3::new(held[j].offset.x, 0.0, held[j].offset.z);
-                        let other_yaw = gamma + held[j].rel_yaw;
-                        occupied
-                            .iter()
-                            .filter(|(o, _)| (o.y - pos.y).abs() < 0.02)
-                            .map(|(o, oy)| overlap(other, other_yaw, *o, *oy, size))
-                            .sum::<f32>()
-                    })
-                    .sum();
-                if best.is_none_or(|b| score < b.0 - 1e-6) {
-                    best = Some((score, k, gamma));
+                let mean_spot = order.iter().map(|&j| spots[j].0).sum::<Vec3>() / k as f32;
+                let mean_off = subset.iter().map(|&b| Vec3::new(held[b].offset.x, 0.0, held[b].offset.z)).sum::<Vec3>() / k as f32;
+                let centre = mean_spot - rot * mean_off;
+                let mut score = 0.0;
+                for (n, &b) in subset.iter().enumerate() {
+                    if !aligned(gamma + held[b].rel_yaw, spots[order[n]].1) {
+                        score += 100.0;
+                    }
+                }
+                for &j in remaining.iter().filter(|j| !subset.contains(j)) {
+                    let other = centre + rot * Vec3::new(held[j].offset.x, 0.0, held[j].offset.z);
+                    let other_yaw = gamma + held[j].rel_yaw;
+                    score += occupied
+                        .iter()
+                        .filter(|(o, _)| (o.y - spots[0].0.y).abs() < 0.02)
+                        .map(|(o, oy)| overlap(other, other_yaw, *o, *oy, size))
+                        .sum::<f32>();
+                }
+                if best.as_ref().is_none_or(|b| score < b.0 - 1e-6) {
+                    best = Some((score, subset.clone(), order, gamma));
                 }
             }
         }
-        let Some((_, k, gamma)) = best else { break };
+        let Some((_, subset, order, gamma)) = best else { break };
         let rot = Quat::from_rotation_y(gamma);
-        let centre = pos - rot * Vec3::new(held[k].offset.x, 0.0, held[k].offset.z);
+        let mean_spot = order.iter().map(|&j| spots[j].0).sum::<Vec3>() / k as f32;
+        let mean_off = subset.iter().map(|&b| Vec3::new(held[b].offset.x, 0.0, held[b].offset.z)).sum::<Vec3>() / k as f32;
+        let centre = mean_spot - rot * mean_off;
         drops.push(Drop {
-            boxes: vec![(held[k].entity, pos, yaw)],
-            top: Vec3::new(centre.x, pos.y - h / 2.0, centre.z),
+            boxes: subset.iter().zip(&order).map(|(&b, &j)| (held[b].entity, spots[j].0, spots[j].1)).collect(),
+            top: Vec3::new(centre.x, spots[0].0.y - h / 2.0, centre.z),
             yaw: gamma,
-            slots: vec![slot],
-            units: 1,
+            slots: order.iter().map(|&j| slots[j]).collect(),
+            units: k as u32,
             exact: true,
         });
-        occupied.push((pos, yaw));
-        remaining.retain(|&j| j != k);
+        occupied.extend(spots);
+        remaining.retain(|j| !subset.contains(j));
     }
     drops
 }
@@ -693,14 +721,14 @@ fn plan_cycle(
     let content = pallet_loads.get(pallet_entity).ok();
     let pattern = tdp_eq.params.pattern.as_ref();
     let filled: &[u32] = content.map_or(&[], |c| &c.filled);
-    let todo: Vec<u32> = pattern.map_or_else(Vec::new, |p| p.sequence().into_iter().filter(|s| !filled.contains(s)).collect());
-    if let Some(p) = pattern {
-        if todo.is_empty() {
+    let pick = pattern.and_then(|p| current_pick(p, filled));
+    if pattern.is_some() {
+        let Some((spec, _)) = &pick else {
             return Err("Pallet completo");
-        }
-        // Take only what the pallet still needs; one product is the one the
-        // empurrador pushed (lane out, lowest Z on the mesa).
-        let need = todo.len().min(p.per_pick.max(1) as usize);
+        };
+        // Take only what the pick needs; one product is the one the empurrador
+        // pushed (lane out, lowest Z on the mesa).
+        let need: usize = spec.iter().map(|d| d.len()).sum();
         if group.len() > need {
             let to_pick = pick_tf.compute_affine().inverse();
             group.sort_by(|a, b| to_pick.transform_point3(a.1).z.total_cmp(&to_pick.transform_point3(b.1).z));
@@ -741,11 +769,15 @@ fn plan_cycle(
         })
         .collect::<Vec<_>>();
     let mut held = held;
-    if pick_eq.kind.is_mesa() && held.len() == 2 {
-        // The clamps close the pair against each other (no gap between the fardos).
-        for (i, (_, _, rot, size)) in group.iter().enumerate() {
-            let half = half_extent_along(to_group * *rot, *size, Vec3::Z);
-            held[i].offset.z = half * held[i].offset.z.signum();
+    if pick_eq.kind.is_mesa() && held.len() >= 2 {
+        // The clamps close the fardos against each other (no gap between them).
+        let mut order: Vec<usize> = (0..held.len()).collect();
+        order.sort_by(|&a, &b| held[a].offset.z.total_cmp(&held[b].offset.z));
+        let widths: Vec<f32> = group.iter().map(|(_, _, rot, size)| 2.0 * half_extent_along(to_group * *rot, *size, Vec3::Z)).collect();
+        let mut z = -widths.iter().sum::<f32>() / 2.0;
+        for i in order {
+            held[i].offset.z = z + widths[i] / 2.0;
+            z += widths[i];
         }
     }
     // TCP at the bottom of the fardos (tips of the clamps).
@@ -754,13 +786,10 @@ fn plan_cycle(
     // Stack on top of the cardboard sheets.
     let sheets_dy = content.map_or(0, |p| p.sheets) as f32 * crate::paper::SHEET_THICKNESS;
     let unit = Vec3::new(max.x - min.x, height, max.z - min.z);
-    let (drops, remaining_after) = match pattern {
-        Some(p) => {
-            let drops = pattern_drops(p, pallet_size.y, &held, &todo, filled, sheets_dy);
-            let taken: usize = drops.iter().map(|d| d.boxes.len()).sum();
-            (drops, Some(todo.len() - taken))
-        }
-        None => {
+    let (drops, next_size) = match (pattern, &pick) {
+        (Some(p), Some((spec, next))) => (pattern_drops(p, pallet_size.y, &held, spec, filled, sheets_dy), Some(*next)),
+        (Some(_), None) => return Err("Pallet completo"),
+        (None, _) => {
             // Automatic grid: the pallet keeps the footprint of its first placement.
             let units_done = content.map_or(0, |p| p.units);
             let unit = content.and_then(|p| p.unit_size).unwrap_or(unit);
@@ -812,7 +841,7 @@ fn plan_cycle(
         drops,
         safe_y,
         above: Pose { y: safe_y, yaw: grip_yaw, ..pick_pose },
-        remaining_after,
+        next_size,
     })
 }
 
@@ -953,6 +982,19 @@ pub fn robot_program(
                         state.status = "Aguardando liberação (start)".into();
                         break 'logic;
                     }
+                    // While waiting, tell the next mesa how many fardos the coming pick needs
+                    // (receita 10x1: FardosPonto 3 or 4) for the pallet in progress.
+                    if let Some(&(_, tdp_eq, Some(tdp))) = tdps.first()
+                        && let (Some(pattern), Some(pallet)) = (tdp_eq.params.pattern.as_ref(), tdp.pallet)
+                        && let Some((spec, _)) = current_pick(pattern, pallet_loads.get(pallet).map_or(&[][..], |c| &c.filled))
+                        && let Some(&(mesa, ..)) = picks.first()
+                        && let Ok(mut logic) = mesas.get_mut(mesa)
+                    {
+                        let n: usize = spec.iter().map(|d| d.len()).sum();
+                        if n >= 3 {
+                            logic.fardos_ponto = n.min(4) as u32;
+                        }
+                    }
                     let mut status: Option<&'static str> = None;
                     let mut wait_for = Vec::new();
                     let mut chosen = None;
@@ -1047,13 +1089,18 @@ pub fn robot_program(
                             drops.join(" ")
                         );
                     }
-                    // Última camada ímpar: one product left after this pick, so the next
-                    // mesa group must be a single fardo.
-                    if plan.remaining_after == Some(1)
+                    // The next mesa group: a single fardo (última camada ímpar) or, with the
+                    // receita 10x1 of the mesa 3 estágios, 3 or 4 fardos (FardosPonto).
+                    if let Some(n) = plan.next_size
                         && let Some(i) = picks.iter().position(|p| p.0 == pick_entity)
                         && let Ok(mut next) = mesas.get_mut(picks[(i + 1) % picks.len()].0)
                     {
-                        next.single_request = true;
+                        if n == 1 {
+                            next.single_request = true;
+                        }
+                        if n >= 3 {
+                            next.fardos_ponto = n.min(4) as u32;
+                        }
                     }
                     claims.owner.insert(pick_entity, robot_entity);
                     claims.owner.insert(tdp_entity, robot_entity);

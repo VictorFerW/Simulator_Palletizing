@@ -373,6 +373,8 @@ pub struct Params {
     pub cp_two_sheets: bool,
     /// Elevador: pallets in a full stack.
     pub stack_size: u32,
+    /// Mesa 3 estágios: receita 10x1 (Fardo10Kg): groups of 3 or 4 fardos side by side.
+    pub fardo_10kg: bool,
     /// TDP de paletização: layer pattern chosen in "Padrões de paletização" (else
     /// the automatic column / interlocked grid).
     pub pattern: Option<crate::pattern::Pattern>,
@@ -423,6 +425,7 @@ impl Default for Params {
             apply_paper: true,
             cp_two_sheets: false,
             stack_size: 10,
+            fardo_10kg: false,
             pattern: None,
             auto_refill: true,
         }
