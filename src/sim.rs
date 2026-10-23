@@ -266,6 +266,21 @@ pub fn move_loads(
             .unwrap_or(f32::MIN)
     };
     snapshot.sort_by(|a, b| key(b.1, b.3).total_cmp(&key(a.1, a.3)));
+    // Side merge (a belt joining another across it): the load waits at the end of its
+    // belt while a load on the other belt passes in front of the merge point.
+    let crossing: Vec<(Entity, Vec3, Quat, Vec3)> = snapshot.clone();
+    let merge_blocked = |o: &Conveyor, end: Vec3, dir_in: Vec3, rot: Quat, size: Vec3, entity: Entity| {
+        let o_dir = o.rotation * Vec3::X;
+        if o_dir.dot(dir_in).abs() > 0.7 {
+            return false; // end to end, not a side merge
+        }
+        crossing.iter().any(|&(other, opos, orot, osize)| {
+            other != entity
+                && o.contains(opos, 0.05)
+                && (opos - end).dot(o_dir).abs()
+                    < half_extent_along(rot, size, o_dir) + half_extent_along(orot, osize, o_dir) + 0.05
+        })
+    };
 
     for i in 0..snapshot.len() {
         let (entity, mut pos, rot, size) = snapshot[i];
@@ -299,6 +314,8 @@ pub fn move_loads(
                         && (o.top_world_y() - c.top_world_y()).abs() < 0.06
                         && !(o.single_load
                             && snapshot.iter().any(|&(other, opos, ..)| other != entity && o.contains(opos, 0.0)))
+                        // once its front is across, the load finishes the merge
+                        && ((pos - end).dot(dir) + half > 0.005 || !merge_blocked(o, end, dir, rot, size, entity))
                 });
                 if !continues {
                     step = step.min(((end - pos).dot(dir) - half).max(0.0));
@@ -367,7 +384,7 @@ pub fn mesa_mechanics(
     time: Res<Time>,
     control: Res<SimControl>,
     mut mesas: Query<(&Equipment, &Transform, &mut Io, &mut MesaMech), Without<Load>>,
-    mut loads: Query<(&mut Load, &mut Transform), Without<Equipment>>,
+    mut loads: Query<(Entity, &mut Load, &mut Transform), Without<Equipment>>,
 ) {
     let dt = scaled_dt(&time, &control);
     for (eq, tf, mut io, mut mech) in &mut mesas {
@@ -417,7 +434,7 @@ pub fn mesa_mechanics(
                 let carrying = mech.lift[i] >= 0.9 && mech.stroke[i] > old_stroke;
                 let reach = eq.params.box_size[2] / 2.0;
                 let ahead = (pusher.face_end - pusher.face_start).signum();
-                for (mut load, mut ltf) in &mut loads {
+                for (_, mut load, mut ltf) in &mut loads {
                     if load.state != LoadState::Free {
                         continue;
                     }
@@ -442,7 +459,61 @@ pub fn mesa_mechanics(
                 continue;
             }
             let face = pusher.face_start + (pusher.face_end - pusher.face_start) * mech.stroke[i];
-            for (load, mut ltf) in &mut loads {
+            if pusher.train {
+                // The plate pushes the whole row; the row stops against the physical
+                // stop on the far side and the cylinder stalls there.
+                let dir = (pusher.face_end - pusher.face_start).signum();
+                // Physical guide of the pré-formadora on the far side (batente físico).
+                let wall = dir * (eq.params.width / 2.0 - 0.005);
+                let mut row: Vec<(f32, f32, Entity)> = Vec::new();
+                for (entity, load, ltf) in loads.iter() {
+                    let local = inverse.transform_point3(ltf.translation);
+                    if load.state == LoadState::Free
+                        && local.x >= pusher.x0
+                        && local.x <= pusher.x1
+                        && local.z.abs() <= eq.params.width / 2.0 + 0.05
+                        && (local.y - load.size.y / 2.0 - eq.params.height).abs() <= 0.06
+                    {
+                        row.push((local.z, half_extent_along(ltf.rotation, load.size, tf.rotation * Vec3::Z), entity));
+                    }
+                }
+                // Nearest to the plate first.
+                row.sort_by(|a, b| (b.0 * -dir).total_cmp(&(a.0 * -dir)));
+                let chain = |face: f32| {
+                    let mut limit = face;
+                    row.iter()
+                        .map(|&(z, half, _)| {
+                            let pushed = if (z + dir * -half - limit) * dir < 0.0 { limit + dir * half } else { z };
+                            limit = pushed + dir * half;
+                            pushed
+                        })
+                        .collect::<Vec<f32>>()
+                };
+                let mut face = face;
+                let mut new_z = chain(face);
+                if let Some((&last, &(_, half, _))) = new_z.last().zip(row.last()) {
+                    let overrun = (last + dir * half - wall) * dir;
+                    if overrun > 0.0 {
+                        face -= dir * overrun;
+                        new_z = chain(face);
+                        let span = pusher.face_end - pusher.face_start;
+                        mech.stroke[i] = ((face - pusher.face_start) / span).clamp(0.0, 1.0);
+                    }
+                }
+                for (&(z, _, entity), &nz) in row.iter().zip(&new_z) {
+                    if (nz - z).abs() > 1e-5
+                        && let Ok((_, _, mut ltf)) = loads.get_mut(entity)
+                    {
+                        let mut local = inverse.transform_point3(ltf.translation);
+                        local.z = nz;
+                        ltf.translation = affine.transform_point3(local);
+                    }
+                }
+                io.set_bool(pusher.sensor_advanced, mech.stroke[i] >= 0.98);
+                io.set_bool(pusher.sensor_retracted, mech.stroke[i] <= 0.02);
+                continue;
+            }
+            for (_, load, mut ltf) in &mut loads {
                 if load.state != LoadState::Free {
                     continue;
                 }
@@ -456,7 +527,9 @@ pub fn mesa_mechanics(
                     continue;
                 }
                 let half_z = half_extent_along(ltf.rotation, load.size, tf.rotation * Vec3::Z);
-                if local.z + half_z > face {
+                // Only fardos in front of the plate: one that rolls into the stroke after
+                // the plate went past its lane stays behind it (no jump to the plate face).
+                if local.z + half_z > face && local.z < face {
                     local.z = (face - half_z).max(-eq.params.width / 2.0 + half_z);
                     ltf.translation = affine.transform_point3(local);
                 }
@@ -783,7 +856,9 @@ pub fn animate_conveyors(
     }
 }
 
-/// Removes every load and resets robots and mesas (toolbar "Reiniciar").
+/// Removes every load and resets robots, mesas, elevators, CPs and the CVZ/CCH cars
+/// (toolbar "Reiniciar"): each FB back to its first step, cars back to the rail start.
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
 pub fn reset_simulation(
     mut control: ResMut<SimControl>,
     mut commands: Commands,
@@ -792,6 +867,13 @@ pub fn reset_simulation(
     mut emitters: Query<&mut EmitterState>,
     mut mesas: Query<(&Equipment, &mut crate::mesa_logic::MesaLogic, &mut MesaMech)>,
     mut elevators: Query<(&Equipment, &mut crate::elevator::ElevatorState, &mut crate::elevator::ElevatorLogic)>,
+    mut shuttles: Query<(
+        &mut crate::shuttle::ShuttleState,
+        Option<&mut crate::shuttle::ShuttleLogic>,
+        Option<&mut crate::fullcar::FullCarLogic>,
+        &mut Io,
+    )>,
+    mut placers: Query<(&mut crate::paper::PaperPlacerState, &mut crate::paper::PaperPlacerLogic, &mut Io), Without<crate::shuttle::ShuttleState>>,
 ) {
     if !control.reset_requested {
         return;
@@ -804,7 +886,7 @@ pub fn reset_simulation(
         }
     }
     for mut r in &mut robots {
-        *r = crate::robot::RobotState::default();
+        *r = crate::robot::RobotState::new(r.kin);
     }
     for mut e in &mut emitters {
         e.timer = 0.0;
@@ -818,5 +900,22 @@ pub fn reset_simulation(
     for (eq, mut state, mut logic) in &mut elevators {
         *state = crate::elevator::ElevatorState::new(&eq.params);
         *logic = default();
+    }
+    // Outputs the FBs wrote stay in the I/O until the logic writes them again: clear
+    // them so no motor or cylinder keeps running from the interrupted cycle.
+    for (mut state, shuttle, fullcar, mut io) in &mut shuttles {
+        *state = default();
+        if let Some(mut logic) = shuttle {
+            *logic = default();
+        }
+        if let Some(mut logic) = fullcar {
+            *logic = default();
+        }
+        io.values.clear();
+    }
+    for (mut state, mut logic, mut io) in &mut placers {
+        *state = default();
+        *logic = default();
+        io.values.clear();
     }
 }

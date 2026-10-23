@@ -59,7 +59,45 @@ pub struct LayoutRequests {
     pub load: Option<PathBuf>,
     pub new_default: bool,
     pub clear: bool,
+    /// Saved as soon as the new scene is built (a new project gets its file).
+    pub save_after_rebuild: Option<PathBuf>,
+    /// File of the open project ("Salvar" writes here).
+    pub current: Option<PathBuf>,
     pub message: String,
+}
+
+/// Top view of a layout file for the start screen: each equipment's footprint.
+pub struct Preview {
+    pub items: Vec<(EquipmentKind, [Vec2; 4])>,
+    pub min: Vec2,
+    pub max: Vec2,
+}
+
+/// Reads a layout file and returns its footprints (x, z on the floor).
+pub fn preview(path: &std::path::Path) -> Result<Preview, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    let file: LayoutFile = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+    let mut items = Vec::new();
+    let (mut min, mut max) = (Vec2::splat(f32::MAX), Vec2::splat(f32::MIN));
+    for item in file.equipment {
+        let eq = Equipment { name: item.name, kind: item.kind, params: item.params };
+        let (lo, hi) = eq.local_bounds();
+        let rot = Quat::from_rotation_y(item.yaw_deg.to_radians());
+        let at = Vec3::from_array(item.position);
+        let corners = [(lo.x, lo.z), (hi.x, lo.z), (hi.x, hi.z), (lo.x, hi.z)].map(|(x, z)| {
+            let p = at + rot * Vec3::new(x, 0.0, z);
+            Vec2::new(p.x, p.z)
+        });
+        for c in corners {
+            min = min.min(c);
+            max = max.max(c);
+        }
+        items.push((eq.kind, corners));
+    }
+    if items.is_empty() {
+        (min, max) = (Vec2::splat(-1.0), Vec2::splat(1.0));
+    }
+    Ok(Preview { items, min, max })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -108,7 +146,11 @@ pub fn process_layout_requests(
             .map_err(|e| e.to_string())
             .and_then(|json| std::fs::write(&path, json).map_err(|e| e.to_string()))
         {
-            Ok(()) => format!("Layout salvo em {}", path.display()),
+            Ok(()) => {
+                crate::projects::remember(&path);
+                requests.current = Some(path.clone());
+                format!("Layout salvo em {}", path.display())
+            }
             Err(e) => format!("Falha ao salvar: {e}"),
         };
     }
@@ -125,6 +167,8 @@ pub fn process_layout_requests(
         {
             Ok(file) => {
                 requests.message = format!("Layout carregado de {}", path.display());
+                crate::projects::remember(&path);
+                requests.current = Some(path.clone());
                 Some(file)
             }
             Err(e) => {
@@ -182,11 +226,18 @@ pub fn process_layout_requests(
             );
             commands.entity(entity).insert(Io { manual: item.manual, ..default() });
         }
-    } else if requests.new_default {
-        spawn_default_cell(&mut commands, &mut meshes, &palette);
+    } else {
+        // New scene (default cell or empty): no file until it is saved.
+        requests.current = None;
+        if requests.new_default {
+            spawn_default_cell(&mut commands, &mut meshes, &palette);
+        }
     }
     requests.new_default = false;
     requests.clear = false;
+    if let Some(path) = requests.save_after_rebuild.take() {
+        requests.save = Some(path);
+    }
 }
 
 /// Default cell (Selgron layout): Linha 1A/1 (with Linha 1B joining from the side)
@@ -214,14 +265,28 @@ pub fn spawn_default_cell(commands: &mut Commands, meshes: &mut Assets<Mesh>, pa
     // Linha 1A + Linha 1 -> Mesa 1; Linha 1B joins Linha 1 from the side.
     let z1 = -0.45;
     add(EquipmentKind::BoxEmitter, "Emissor_Linha1A", (-7.8, z1), 0.0, &none);
-    add(EquipmentKind::BeltConveyor, "Linha_1", (-5.5, z1), 0.0, &|p| p.length = 4.6);
-    add(EquipmentKind::BoxEmitter, "Emissor_Linha1B", (-4.6, -2.9), -90.0, &|p| p.interval = 12.0);
-    add(EquipmentKind::BeltConveyor, "Linha_1B", (-4.6, -1.88), -90.0, &|p| p.length = 2.0);
+    // Guides close to the fardo width keep every fardo on the entry lane (a fardo
+    // coming from Linha 1B would otherwise reach the mesa on the pushed lane).
+    let guided = Params::for_kind(EquipmentKind::Table2Stage).box_size[2] + 0.02;
+    add(EquipmentKind::BeltConveyor, "Linha_1", (-5.5, z1), 0.0, &|p| {
+        p.length = 4.6;
+        p.width = guided;
+    });
+    // Linha 1B runs across Linha 1: its fardos are emitted turned so they reach Linha 1
+    // in the same orientation as the others.
+    add(EquipmentKind::BoxEmitter, "Emissor_Linha1B", (-4.6, -2.6), -90.0, &|p| {
+        p.interval = 12.0;
+        p.box_size = [p.box_size[2], p.box_size[1], p.box_size[0]];
+    });
+    add(EquipmentKind::BeltConveyor, "Linha_1B", (-4.6, -1.63), -90.0, &|p| p.length = 2.0);
     add(EquipmentKind::Table2Stage, "Mesa_1", (-2.0, z1 - lane), 0.0, &none);
     // Linha 2 -> Mesa 2.
     let z2 = 1.35;
     add(EquipmentKind::BoxEmitter, "Emissor_Linha2", (-6.2, z2), 0.0, &none);
-    add(EquipmentKind::BeltConveyor, "Linha_2", (-4.7, z2), 0.0, &|p| p.length = 3.0);
+    add(EquipmentKind::BeltConveyor, "Linha_2", (-4.7, z2), 0.0, &|p| {
+        p.length = 3.0;
+        p.width = guided;
+    });
     add(EquipmentKind::Table2Stage, "Mesa_2", (-2.0, z2 - lane), 0.0, &none);
 
     // J1 has ±180°: 0° points away from the widest free sector, so no transfer
@@ -229,7 +294,7 @@ pub fn spawn_default_cell(commands: &mut Commands, meshes: &mut Assets<Mesh>, pa
     add(EquipmentKind::Robot, "FANUC_M410iC_1", (0.0, 0.0), 141.0, &none);
 
     // Three rows of TDP 1560 mm toward the carro cheio (receive edge at x = 4.085).
-    let palletizing = |p: &mut Params| p.layers = 4;
+    let palletizing = |p: &mut Params| p.layers = 3;
     for (row, z, first) in [("1", -1.62, 0.185), ("2", -0.15, 1.745), ("3", 1.47, 0.185)] {
         add(EquipmentKind::PalletizingConveyor, &format!("TDP_Palet_{row}"), (first, z), 0.0, &palletizing);
         add(EquipmentKind::PalletDispenser, &format!("Magazine_{row}"), (first, z), 0.0, &none);
@@ -253,9 +318,14 @@ pub fn spawn_default_cell(commands: &mut Commands, meshes: &mut Assets<Mesh>, pa
     add(EquipmentKind::BoxRemover, "Removedor_Saida", (5.0, -6.4), 90.0, &|p| p.length = 0.8);
 }
 
-pub fn setup_default_cell(mut requests: ResMut<LayoutRequests>) {
+/// At start: the layout of `PDT_LAYOUT`, the default cell for automated screenshots
+/// (`PDT_SCREENSHOT`), otherwise the start screen (projects).
+pub fn setup_default_cell(mut requests: ResMut<LayoutRequests>, mut start: ResMut<crate::projects::StartScreen>) {
     match std::env::var("PDT_LAYOUT") {
         Ok(path) => requests.load = Some(path.into()),
-        Err(_) => requests.new_default = true,
+        Err(_) if std::env::var("PDT_SCREENSHOT").is_ok() && std::env::var("PDT_START").is_err() => {
+            requests.new_default = true
+        }
+        Err(_) => start.show(),
     }
 }

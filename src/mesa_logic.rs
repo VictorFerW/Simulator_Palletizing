@@ -10,7 +10,9 @@
 //! pushed side only. Mesa 3 estágios: besides the normal recipe, the receita 10x1
 //! (`Fardo10Kg = 1`, steps 100..300 of the roletada and 100..202 of the
 //! pré-formadora) forms groups of 3 or 4 fardos side by side; the number comes from
-//! the robot (`FardosPonto`). `Produto_10x1` of the mesa 2 estágios stays off.
+//! the robot (`FardosPonto`). A group of 4 is formed as on the machine: the roletada
+//! accumulates 3 (two strokes of the garra and a third fardo), the empurrador pushes
+//! the 3 against the stop and the 4th comes straight (steps 210..212 and 401..403). `Produto_10x1` of the mesa 2 estágios stays off.
 //! Actuators driven by a connected PLC always win over this logic.
 
 use bevy::prelude::*;
@@ -481,6 +483,10 @@ pub struct PreForma3 {
     /// Recipe of the last scan: a change restarts both sequences (Tipo_Produto_Alterado).
     last_10kg: bool,
     solicitar_fardo_pac1: bool,
+    /// The pré-formadora asks the roletada for 3 fardos (group of 4).
+    solicitar_fardo3: bool,
+    /// A group was sent to the coleta this scan (the next size of the sequence).
+    pub group_sent: bool,
     espera_pressao: bool,
     t_pressao: Ton,
 }
@@ -557,7 +563,7 @@ impl PreForma3 {
                 }
                 raise_if_back(self);
             }
-            101 | 202 => {
+            101 | 202 | 211 => {
                 // Aguarda fardo acionar sensor na roleta
                 raise_if_back(self);
                 self.espera_pac_rol = s.pac1_prox_bloq || s.e1p1;
@@ -567,7 +573,30 @@ impl PreForma3 {
                 if q_sep_rol {
                     self.espera_pac_rol = false;
                     self.bloqueio_entrada = true;
-                    self.passo_roletada = if self.passo_roletada == 101 { 102 } else { 203 };
+                    self.passo_roletada = match self.passo_roletada {
+                        101 => 102,
+                        202 => 203,
+                        _ => 212,
+                    };
+                }
+            }
+            210 => {
+                // Grupo de 4: receber o terceiro fardo (os dois primeiros já empurrados)
+                if s.esteira && !s.e1p1 && !s.pac1_prox_bloq {
+                    self.motor_roletada = true;
+                    self.bloqueio_entrada = false;
+                    self.passo_roletada = 211;
+                }
+                raise_if_back(self);
+            }
+            212 => {
+                // Aguarda o terceiro fardo chegar na posição
+                raise_if_back(self);
+                self.espera_ent_pac_rol = s.e1p1;
+                if q_ent_pac_rol {
+                    self.motor_roletada = false;
+                    self.espera_ent_pac_rol = false;
+                    self.passo_roletada = 205;
                 }
             }
             102 => {
@@ -585,8 +614,8 @@ impl PreForma3 {
                     self.motor_roletada = true;
                     self.passo_roletada = 103;
                 }
-                // Está solicitando 2 fardos: primeiro acumular os dois
-                if self.solicitar_fardo && q_ent_pac_rol {
+                // Está solicitando 2 (ou 3) fardos: primeiro acumular
+                if (self.solicitar_fardo || self.solicitar_fardo3) && q_ent_pac_rol {
                     self.garra_sobe = true;
                     self.garra_desce = false;
                     if s.garra_levantada {
@@ -656,7 +685,11 @@ impl PreForma3 {
                     self.garra_avancar = false;
                 }
                 if s.garra_recolhida {
-                    self.passo_roletada = if self.passo_roletada == 200 { 201 } else { 205 };
+                    self.passo_roletada = match self.passo_roletada {
+                        200 => 201,
+                        _ if self.solicitar_fardo3 => 210,
+                        _ => 205,
+                    };
                 }
             }
             201 => {
@@ -685,8 +718,8 @@ impl PreForma3 {
                 }
             }
             205 => {
-                // A pré-formadora pede dois fardos: envia
-                if self.solicitar_fardo {
+                // A pré-formadora pede os fardos: envia
+                if self.solicitar_fardo || self.solicitar_fardo3 {
                     self.motor_preformadora = true;
                     self.bloqueio_meio = false;
                     self.motor_roletada = true;
@@ -862,6 +895,48 @@ impl PreForma3 {
                 self.bloqueio_coleta = true;
                 self.passo_preformadora = 200;
             }
+            100 if self.fardos_ponto == 4 => {
+                // Grupo de 4: pede 3 fardos à roletada
+                self.bloqueio_coleta = true;
+                if s.emp_rec {
+                    self.solicitar_fardo3 = true;
+                    if !self.bloqueio_meio {
+                        self.solicitar_fardo3 = false;
+                        self.passo_preformadora = 401;
+                    }
+                }
+            }
+            401 => {
+                // Aguarda os 3 fardos chegarem
+                if s.e2p1 && s.e2p3 {
+                    self.espera_ent_pac_pre = true;
+                }
+                if q_ent_pre {
+                    self.motor_preformadora = false;
+                    self.espera_ent_pac_pre = false;
+                    self.passo_preformadora = 402;
+                }
+            }
+            402 => {
+                // Empurra os 3 até o batente físico
+                self.empurrador_avancar = true;
+                self.empurrador_recuar = false;
+                if s.e2p2 {
+                    self.espera_pressao = true;
+                }
+                if q_pressao {
+                    self.espera_pressao = false;
+                    self.passo_preformadora = 403;
+                }
+            }
+            403 => {
+                // Recua o empurrador e pede o último fardo reto
+                self.empurrador_avancar = false;
+                self.empurrador_recuar = true;
+                if s.emp_rec {
+                    self.passo_preformadora = 110;
+                }
+            }
             100 | 110 => {
                 // Solicitar um fardo para a posição 1 (110: o último de um grupo de 4)
                 if self.passo_preformadora == 100 {
@@ -945,6 +1020,7 @@ impl PreForma3 {
             }
             106 => {
                 // Envia o grupo para a coleta
+                self.group_sent = true;
                 self.passo_preformadora = 107;
                 self.bloqueio_coleta = false;
                 self.antecipada_transferindo = true;
@@ -1156,6 +1232,10 @@ pub struct MesaLogic {
     pub single_request: bool,
     /// Mesa 3 estágios, receita 10x1: fardos the next group needs (FardosPonto, 3 or 4).
     pub fardos_ponto: u32,
+    /// Sizes of the robot's picks for a whole pallet (from the pattern) and the group
+    /// the mesa is forming: the group size is decided when the group starts.
+    pub size_cycle: Vec<u32>,
+    pub group_index: usize,
 }
 
 impl MesaLogic {
@@ -1165,7 +1245,15 @@ impl MesaLogic {
             EquipmentKind::Table3Stage => MesaProgram::PreForma(PreForma3::default()),
             _ => return None,
         };
-        Some(Self { program, coleta: Coleta::default(), robot_collected: false, single_request: false, fardos_ponto: 3 })
+        Some(Self {
+            program,
+            coleta: Coleta::default(),
+            robot_collected: false,
+            single_request: false,
+            fardos_ponto: 3,
+            size_cycle: Vec::new(),
+            group_index: 0,
+        })
     }
 
     pub fn status(&self) -> String {
@@ -1245,8 +1333,14 @@ pub fn run_mesas(time: Res<Time>, control: Res<SimControl>, mut mesas: Query<(&E
                     emp_rec: io.get_bool("SensorEmpurradorRec"),
                 };
                 p.fardo_10kg = eq.params.fardo_10kg;
+                if !logic.size_cycle.is_empty() {
+                    logic.fardos_ponto = logic.size_cycle[logic.group_index % logic.size_cycle.len()];
+                }
                 p.fardos_ponto = logic.fardos_ponto;
                 p.tick(&s, pronto, recebido, dt);
+                if std::mem::take(&mut p.group_sent) {
+                    logic.group_index += 1;
+                }
                 drive(&mut io, "Motor", p.motor());
                 drive(&mut io, "BloqueioEntrada", p.bloqueio_entrada);
                 drive(&mut io, "BloqueioMeio", p.bloqueio_meio);

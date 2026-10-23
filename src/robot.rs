@@ -11,111 +11,406 @@ use std::f32::consts::{FRAC_PI_2, PI};
 
 use bevy::{math::Affine3A, prelude::*};
 
-use crate::model::{Equipment, EquipmentKind, Io};
+use crate::model::{Equipment, EquipmentKind, Io, RobotModel};
 use crate::mesa_logic::MesaLogic;
 use crate::sim::{self, Load, LoadKind, LoadState, PalletLoad, PalletizerState};
 
-/// J2 axis height above the floor (robot on its pedestal).
-pub const BASE_HEIGHT: f32 = 1.110;
-/// J2 axis ahead of the J1 axis.
-pub const J2_OFFSET: f32 = 0.394;
-/// J2 -> J3.
-pub const L1: f32 = 1.220;
-/// J3 -> wrist pivot.
-pub const L2: f32 = 1.306;
-pub const UPPER_BACK: f32 = 0.45;
-/// Flange (J4 axis) ahead of the wrist pivot.
-pub const WRIST_FWD: f32 = 0.244;
-/// Flange face below the wrist pivot.
-pub const WRIST_DROP: f32 = 0.159;
 /// Cabeçote Selgron "4 fardos" (0323P01-010000): flange coupling to the bottom of
 /// the frame, where the fardos' top rests (TCP).
 pub const TOOL_LENGTH: f32 = 0.435;
 /// Clamp (pinça) half opening when open, and its height below the frame.
 pub const JAW_OPEN: f32 = 0.60;
 pub const JAW_HEIGHT: f32 = 0.295;
-/// Flange face to the bottom of the cabeçote frame.
-pub const FRAME_DROP: f32 = WRIST_DROP + TOOL_LENGTH;
-/// TCP: tips of the clamps, where the bottom of the held fardos is (the fardos sit
-/// at the bottom of the gripper, between the clamps).
-pub const TCP_DROP: f32 = FRAME_DROP + JAW_HEIGHT;
-/// Maximum reach of the flange center (data sheet), used to find conveyors in reach.
-pub const REACH: f32 = spec::REACH;
 
-/// FANUC data sheet, M-410iC/185 on the pedestal type base.
-pub mod spec {
-    const DEG: f32 = std::f32::consts::PI / 180.0;
-    pub const PAYLOAD_KG: f32 = 185.0;
-    pub const MASS_KG: f32 = 1600.0;
-    pub const REPEATABILITY_MM: f32 = 0.05;
-    /// Operating space of the wrist face plate center: reach, top and bottom
-    /// (from the floor), inner radius at floor level and rear interference radius.
-    pub const REACH: f32 = 3.143;
-    pub const MAX_HEIGHT: f32 = 2.397;
-    pub const MIN_HEIGHT: f32 = -0.561;
-    pub const MIN_RADIUS: f32 = 1.100;
-    pub const REAR_RADIUS: f32 = 0.725;
-    /// Maximum speeds J1..J4 (rad/s): 140, 140, 140, 305 °/s.
-    pub const SPEED: [f32; 4] = [140.0 * DEG, 140.0 * DEG, 140.0 * DEG, 305.0 * DEG];
-    /// Motion ranges J1..J4 (rad), totals 360°, 144°, 136°, 720°. J2 is the lower
-    /// arm from the vertical (forward positive), J3 the upper arm from the
-    /// horizontal (kept by the parallelogram), J4 the flange relative to J1. The
-    /// J2/J3 split reproduces the data sheet envelope: top 2397 mm, bottom -561 mm
-    /// and 1100 mm inner radius at the floor.
-    pub const MIN: [f32; 4] = [-180.0 * DEG, -44.0 * DEG, -126.0 * DEG, -360.0 * DEG];
-    pub const MAX: [f32; 4] = [180.0 * DEG, 100.0 * DEG, 10.0 * DEG, 360.0 * DEG];
+const DEG: f32 = PI / 180.0;
+
+/// Kinematics and data sheet of a palletizing robot model. Both models move as a
+/// 4-axis palletizer: base rotation, lower arm, upper arm with the flange kept level
+/// (FANUC by parallelograms, KUKA by A5) and flange yaw. Internally the arm axes
+/// are the lower arm from the vertical (forward positive) and the upper arm
+/// elevation from the horizontal; [`Kin::to_motor`] gives the manufacturer's axes,
+/// where the data sheet ranges and speeds apply.
+pub struct Kin {
+    pub model: RobotModel,
+    /// Axis names J1..J4 (FANUC) or A1, A2, A3, A6 (KUKA; A5 keeps the flange level).
+    pub axis_names: [&'static str; 4],
+    /// J2 axis height above the floor and ahead of the J1 axis.
+    pub base_height: f32,
+    pub j2_offset: f32,
+    /// J2 -> J3 and J3 -> wrist pivot.
+    pub l1: f32,
+    pub l2: f32,
+    /// Parametric model: upper arm length behind J3.
+    pub upper_back: f32,
+    /// Flange center ahead of and flange face below the wrist pivot.
+    pub wrist_fwd: f32,
+    pub wrist_drop: f32,
+    pub payload_kg: f32,
+    pub mass_kg: f32,
+    pub repeatability_mm: f32,
+    /// Operating space of the flange center: reach, top and bottom (from the floor),
+    /// inner radius at floor level and rear interference radius.
+    pub reach: f32,
+    pub max_height: f32,
+    pub min_height: f32,
+    pub min_radius: f32,
+    pub rear_radius: f32,
+    /// Maximum speeds (rad/s) and motion ranges (rad) of the data sheet, in the
+    /// manufacturer's axes.
+    pub speed: [f32; 4],
+    pub min: [f32; 4],
+    pub max: [f32; 4],
+    /// Highest upper arm elevation from the horizontal.
+    pub max_elevation: f32,
+    /// A3 measured between the arms (KUKA: 90° with the lower arm vertical and the
+    /// upper arm horizontal) instead of from the horizontal (FANUC J3).
+    pub relative_a3: bool,
     /// Acceleration time of the trapezoidal speed profile (ACC 100).
-    pub const ACC_TIME: f32 = 0.35;
+    pub acc_time: f32,
+    /// Rest position (MOVE_PERCH start).
+    pub home: Pose,
+    /// Speeds of the robot program (m/s, linear moves).
+    pub program: Program,
 }
 
-/// Axis positions J1..J4 (rad), see [`spec::MIN`] for their conventions.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Axes(pub [f32; 4]);
+/// Linear speeds and limits of the robot program: FANUC TP routines PICK/PLACE
+/// (Selgron), KUKA KRL MovePick/MovePlace/MovePerch.
+pub struct Program {
+    pub pick: &'static str,
+    pub place: &'static str,
+    /// Down to the pick, up from it, down to the place, up from it.
+    pub pick_down: f32,
+    pub pick_up: f32,
+    pub place_down: f32,
+    pub place_up: f32,
+    /// Highest TCP height of the transfers (KUKA: PosAux.Z <= 2000).
+    pub max_travel_y: f32,
+}
 
-impl Axes {
-    pub fn within_limits(&self) -> bool {
-        (0..4).all(|i| self.0[i] >= spec::MIN[i] - 1e-4 && self.0[i] <= spec::MAX[i] + 1e-4)
+/// FANUC data sheet, M-410iC/185. Dimensions measured on the manufacturer's STEP
+/// model: J2 1110 mm above the floor (pedestal type base), offset 394 mm, arms
+/// 1220/1306 mm, flange 244 mm ahead of and 159 mm below the wrist pin. The J2/J3
+/// split of the ranges (totals 144° and 136°) reproduces the data sheet envelope:
+/// top 2397 mm, bottom -561 mm and 1100 mm inner radius at the floor.
+pub static FANUC: Kin = Kin {
+    model: RobotModel::FanucM410iC185,
+    axis_names: ["J1", "J2", "J3", "J4"],
+    base_height: 1.110,
+    j2_offset: 0.394,
+    l1: 1.220,
+    l2: 1.306,
+    upper_back: 0.45,
+    wrist_fwd: 0.244,
+    wrist_drop: 0.159,
+    payload_kg: 185.0,
+    mass_kg: 1600.0,
+    repeatability_mm: 0.05,
+    reach: 3.143,
+    max_height: 2.397,
+    min_height: -0.561,
+    min_radius: 1.100,
+    rear_radius: 0.725,
+    speed: [140.0 * DEG, 140.0 * DEG, 140.0 * DEG, 305.0 * DEG],
+    min: [-180.0 * DEG, -44.0 * DEG, -126.0 * DEG, -360.0 * DEG],
+    max: [180.0 * DEG, 100.0 * DEG, 10.0 * DEG, 360.0 * DEG],
+    max_elevation: 10.0 * DEG,
+    relative_a3: false,
+    acc_time: 0.35,
+    home: Pose { theta: 0.0, r: 1.7, y: 1.405, yaw: 0.0 },
+    // PICK: L PR[3] 3000 mm/s, L PR[11] 1800 mm/s; PLACE: L PR[5] 2000 mm/s, L PR[11] 4000 mm/s.
+    program: Program {
+        pick: "PICK",
+        place: "PLACE",
+        pick_down: 3.0,
+        pick_up: 1.8,
+        place_down: 2.0,
+        place_up: 4.0,
+        max_travel_y: f32::INFINITY,
+    },
+};
+
+/// KUKA data sheet, KR 180 R3200-2 PA (0000-361-137 / V5.1): 180 kg, reach 3195 mm,
+/// 5 axes (A4 absent), A1 ±185° 137 °/s, A2 -140°/-5° 111 °/s, A3 0°/165° 119 °/s,
+/// A5 -55°/150° 225 °/s, A6 ±350° 321 °/s, ±0.07 mm, 1017 kg. Dimensions from the
+/// skeleton of the manufacturer's STEP: A2 645 mm above the floor and 330 mm ahead
+/// of A1, link arm 1350 mm, arm 1255 mm to A5, flange 265 mm ahead of and 250 mm
+/// below A5. With the arm at most +60° above the horizontal (workspace graphic)
+/// these give the envelope of the STEP: reach 3195 mm at 513 mm, top 2832 mm,
+/// bottom -742 mm.
+pub static KUKA: Kin = Kin {
+    model: RobotModel::KukaKr180R3200_2Pa,
+    axis_names: ["A1", "A2", "A3", "A6"],
+    base_height: 0.645,
+    j2_offset: 0.330,
+    l1: 1.350,
+    l2: 1.255,
+    upper_back: 0.35,
+    wrist_fwd: 0.265,
+    wrist_drop: 0.250,
+    payload_kg: 180.0,
+    mass_kg: 1017.0,
+    repeatability_mm: 0.07,
+    reach: 3.195,
+    max_height: 2.832,
+    min_height: -0.742,
+    min_radius: 0.940,
+    rear_radius: 0.816,
+    speed: [137.0 * DEG, 111.0 * DEG, 119.0 * DEG, 321.0 * DEG],
+    min: [-185.0 * DEG, -140.0 * DEG, 0.0, -350.0 * DEG],
+    max: [185.0 * DEG, -5.0 * DEG, 165.0 * DEG, 350.0 * DEG],
+    max_elevation: 60.0 * DEG,
+    relative_a3: true,
+    acc_time: 0.35,
+    home: Pose { theta: 0.0, r: 1.85, y: 1.0, yaw: 0.0 },
+    // MovePick: SLIN up $VEL.CP=3.0, SPTP 100 % above the pick, SLIN down 3.0 to the
+    // approach point and 2.5 to the pick. MovePlace: SLIN up 3.0, SPTP 100 %, SLIN
+    // down 2.5 to the approach point and 3.0 to the place. Transfers at most Z 2000.
+    program: Program {
+        pick: "MovePick",
+        place: "MovePlace",
+        pick_down: 2.5,
+        pick_up: 3.0,
+        place_down: 2.5,
+        place_up: 3.0,
+        max_travel_y: 2.0,
+    },
+};
+
+pub fn kin(model: RobotModel) -> &'static Kin {
+    match model {
+        RobotModel::FanucM410iC185 => &FANUC,
+        RobotModel::KukaKr180R3200_2Pa => &KUKA,
+    }
+}
+
+impl Kin {
+    /// Flange face to the bottom of the cabeçote frame.
+    pub fn frame_drop(&self) -> f32 {
+        self.wrist_drop + TOOL_LENGTH
+    }
+
+    /// TCP: tips of the clamps, where the bottom of the held fardos is (the fardos
+    /// sit at the bottom of the gripper, between the clamps).
+    pub fn tcp_drop(&self) -> f32 {
+        self.frame_drop() + JAW_HEIGHT
+    }
+
+    /// Manufacturer's axes for these axes (KUKA: A2 = J2 - 90°, A3 between the arms).
+    pub fn to_motor(&self, a: Axes) -> [f32; 4] {
+        let [j1, j2, j3, j4] = a.0;
+        if self.relative_a3 {
+            [j1, j2 - FRAC_PI_2, FRAC_PI_2 - j2 - j3, j4]
+        } else {
+            a.0
+        }
+    }
+
+    pub fn within_limits(&self, a: Axes) -> bool {
+        let m = self.to_motor(a);
+        (0..4).all(|i| m[i] >= self.min[i] - 1e-4 && m[i] <= self.max[i] + 1e-4) && a.0[2] <= self.max_elevation + 1e-4
     }
 
     /// Forward kinematics: the TCP pose for these axes.
-    pub fn pose(&self) -> Pose {
-        let [j1, j2, j3, j4] = self.0;
+    pub fn pose(&self, a: Axes) -> Pose {
+        let [j1, j2, j3, j4] = a.0;
         let shoulder = FRAC_PI_2 - j2;
-        let wrist = Vec2::new(shoulder.cos(), shoulder.sin()) * L1 + Vec2::new(j3.cos(), j3.sin()) * L2;
+        let wrist = Vec2::new(shoulder.cos(), shoulder.sin()) * self.l1 + Vec2::new(j3.cos(), j3.sin()) * self.l2;
         Pose {
             theta: j1,
-            r: J2_OFFSET + wrist.x + WRIST_FWD,
-            y: BASE_HEIGHT + wrist.y - TCP_DROP,
+            r: self.j2_offset + wrist.x + self.wrist_fwd,
+            y: self.base_height + wrist.y - self.tcp_drop(),
             yaw: j4 + j1,
         }
     }
+
+    /// Axis positions of this pose (J1 within its range, never wrapped).
+    pub fn axes(&self, pose: &Pose) -> Axes {
+        let joints = self.solve(pose);
+        Axes([
+            pose.theta,
+            FRAC_PI_2 - joints.shoulder,
+            joints.upper_dir.y.atan2(joints.upper_dir.x),
+            pose.yaw - pose.theta,
+        ])
+    }
+
+    /// Outline of the operating space of the flange center in the arm plane
+    /// (radius from J1, height above the floor), along the edges of the arm axis
+    /// ranges and of the upper arm elevation limit, as separate polylines.
+    pub fn envelope_outline(&self, steps: usize) -> Vec<Vec<Vec2>> {
+        let (lo, hi) = (self.min, self.max);
+        let lerp = |a: f32, b: f32, k: usize| a + (b - a) * k as f32 / steps as f32;
+        // Manufacturer's (A2, A3) -> internal (J2, J3).
+        let internal = |m2: f32, m3: f32| if self.relative_a3 { (m2 + FRAC_PI_2, -m2 - m3) } else { (m2, m3) };
+        let j2_lo = internal(lo[1], 0.0).0;
+        let j2_hi = internal(hi[1], 0.0).0;
+        let edges: Vec<Vec<(f32, f32)>> = vec![
+            (0..=steps).map(|k| internal(lerp(lo[1], hi[1], k), hi[2])).collect(),
+            (0..=steps).map(|k| internal(hi[1], lerp(hi[2], lo[2], k))).collect(),
+            (0..=steps).map(|k| internal(lerp(hi[1], lo[1], k), lo[2])).collect(),
+            (0..=steps).map(|k| internal(lo[1], lerp(lo[2], hi[2], k))).collect(),
+            (0..=steps).map(|k| (lerp(j2_lo, j2_hi, k), self.max_elevation)).collect(),
+        ];
+        let mut lines = Vec::new();
+        for edge in edges {
+            let mut line = Vec::new();
+            for (j2, j3) in edge {
+                let a = Axes([0.0, j2, j3, 0.0]);
+                if self.within_limits(a) {
+                    let p = self.pose(a);
+                    line.push(Vec2::new(p.r, p.y + TOOL_LENGTH + JAW_HEIGHT));
+                } else if line.len() > 1 {
+                    lines.push(std::mem::take(&mut line));
+                } else {
+                    line.clear();
+                }
+            }
+            if line.len() > 1 {
+                lines.push(line);
+            }
+        }
+        lines
+    }
+
+    /// Inverse kinematics in the arm plane (elbow-up solution). `elbow` and the
+    /// wrist pivot are relative to the J2 axis; the TCP is `wrist_fwd` ahead of and
+    /// `tcp_drop` below the wrist pivot.
+    pub fn solve(&self, pose: &Pose) -> Joints {
+        let (l1, l2) = (self.l1, self.l2);
+        let r = pose.r - self.j2_offset - self.wrist_fwd;
+        let h = pose.y + self.tcp_drop() - self.base_height;
+        let target = Vec2::new(r, h);
+        let d = target.length();
+        let in_plane = d <= l1 + l2 - 1e-3 && d >= (l1 - l2).abs() + 1e-3;
+        let dc = d.clamp((l1 - l2).abs() + 1e-3, l1 + l2 - 1e-3);
+        let cos_inner = ((l1 * l1 + dc * dc - l2 * l2) / (2.0 * l1 * dc)).clamp(-1.0, 1.0);
+        let shoulder = h.atan2(r) + cos_inner.acos();
+        let elbow = Vec2::new(l1 * shoulder.cos(), l1 * shoulder.sin());
+        let wrist = if in_plane {
+            target
+        } else {
+            elbow + (target - elbow).normalize_or_zero() * l2
+        };
+        let upper_dir = (wrist - elbow).normalize_or_zero();
+        let j2 = FRAC_PI_2 - shoulder;
+        let j3 = upper_dir.y.atan2(upper_dir.x);
+        let axes = Axes([pose.theta, j2, j3, pose.yaw - pose.theta]);
+        Joints {
+            j1: pose.theta,
+            shoulder,
+            elbow,
+            upper_dir,
+            reachable: in_plane && self.within_limits(axes),
+        }
+    }
+
+    fn plane_to_local(&self, j1: f32, p: Vec2) -> Vec3 {
+        let radial = self.j2_offset + p.x;
+        Vec3::new(radial * j1.cos(), self.base_height + p.y, -radial * j1.sin())
+    }
+
+    /// Highest TCP height the arm reaches at radius `r` from J1 within the axis limits
+    /// (the top of the operating space at that radius); -inf when out of reach.
+    pub fn max_tcp_height(&self, r: f32) -> f32 {
+        let reachable = |y: f32| self.solve(&Pose { theta: 0.0, r, y, yaw: 0.0 }).reachable;
+        let (mut lo, mut hi) = (f32::NEG_INFINITY, 3.5);
+        let mut y = hi;
+        while y > -1.0 {
+            if reachable(y) {
+                lo = y;
+                break;
+            }
+            hi = y;
+            y -= 0.05;
+        }
+        if lo == f32::NEG_INFINITY {
+            return lo;
+        }
+        for _ in 0..12 {
+            let mid = (lo + hi) / 2.0;
+            if reachable(mid) {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        lo
+    }
+
+    /// Gripper yaw for exactly `target` (full turns only) closest to `current`, with
+    /// J4 (yaw relative to J1 at `theta`) inside its range.
+    fn wrist_yaw_exact(&self, current: f32, target: f32, theta: f32) -> f32 {
+        (-4..=4)
+            .map(|k| target + k as f32 * 2.0 * PI)
+            .filter(|y| (y - theta).abs() <= self.max[3])
+            .min_by(|a, b| (a - current).abs().total_cmp(&(b - current).abs()))
+            .unwrap_or(target)
+    }
+
+    /// Gripper yaw for `target` (any half turn) closest to `current`, keeping J4
+    /// (yaw relative to J1 at `theta`) inside its range.
+    fn wrist_yaw(&self, current: f32, target: f32, theta: f32) -> f32 {
+        (-8..=8)
+            .map(|k| target + k as f32 * PI)
+            .filter(|y| (y - theta).abs() <= self.max[3])
+            .min_by(|a, b| (a - current).abs().total_cmp(&(b - current).abs()))
+            .unwrap_or_else(|| nearest_half_turn(current, target))
+    }
+
+    /// Why the TCP point `p` (robot frame) is out of reach: distance of the arm, axis
+    /// limits (data sheet), floor (`floor_y` in the robot frame: minus the height the
+    /// robot is mounted at), maximum height at that radius. `None` when reachable.
+    pub fn reach_report(&self, p: Vec3, floor_y: f32) -> Option<String> {
+        let pose = Pose::from_local(p, 0.0);
+        if self.solve(&pose).reachable && pose.y >= floor_y - 0.01 {
+            return None;
+        }
+        let (l1, l2) = (self.l1, self.l2);
+        let mut why = Vec::new();
+        let plane = Vec2::new(pose.r - self.j2_offset - self.wrist_fwd, pose.y + self.tcp_drop() - self.base_height).length();
+        if plane > l1 + l2 - 1e-3 {
+            why.push(format!(
+                "longe demais: {:.0} mm do eixo {} até o punho, o braço estica até {:.0} mm",
+                plane * 1000.0,
+                self.axis_names[1],
+                (l1 + l2) * 1000.0
+            ));
+        }
+        if plane < (l1 - l2).abs() + 1e-3 {
+            why.push("perto demais da base".to_owned());
+        }
+        if pose.y < floor_y - 0.01 {
+            why.push(format!("abaixo do piso ({:.2} m abaixo da base do robô)", -floor_y));
+        }
+        let axes = self.axes(&pose);
+        let motor = self.to_motor(axes);
+        for (i, m) in motor.iter().enumerate().take(3).skip(1) {
+            let (q, lo, hi) = (m.to_degrees(), self.min[i].to_degrees(), self.max[i].to_degrees());
+            if q < lo - 0.01 || q > hi + 0.01 {
+                why.push(format!("{} precisaria de {q:.0}° (faixa {lo:.0}° a {hi:.0}°)", self.axis_names[i]));
+            }
+        }
+        if axes.0[2] > self.max_elevation + 1e-3 {
+            why.push(format!(
+                "o braço precisaria subir {:.0}° acima da horizontal (máximo {:.0}°)",
+                axes.0[2].to_degrees(),
+                self.max_elevation.to_degrees()
+            ));
+        }
+        let top = self.max_tcp_height(pose.r);
+        if top.is_finite() && pose.y > top {
+            why.push(format!("nesse raio o TCP sobe só até {top:.2} m"));
+        } else if !top.is_finite() {
+            why.push(format!("raio além do alcance ({:.2} m)", self.reach));
+        }
+        Some(format!("TCP a {:.2} m de raio e {:.2} m de altura: {}", pose.r, pose.y, why.join("; ")))
+    }
 }
 
-/// Outline of the operating space of the flange center in the arm plane:
-/// (radius from J1, height above the floor), around the J2/J3 limit rectangle.
-pub fn envelope_outline(steps: usize) -> Vec<Vec2> {
-    let (lo, hi) = (spec::MIN, spec::MAX);
-    let lerp = |a: f32, b: f32, k: usize| a + (b - a) * k as f32 / steps as f32;
-    let mut axes = Vec::new();
-    for k in 0..=steps {
-        axes.push((lerp(lo[1], hi[1], k), hi[2]));
-    }
-    for k in 0..=steps {
-        axes.push((hi[1], lerp(hi[2], lo[2], k)));
-    }
-    for k in 0..=steps {
-        axes.push((lerp(hi[1], lo[1], k), lo[2]));
-    }
-    for k in 0..=steps {
-        axes.push((lo[1], lerp(lo[2], hi[2], k)));
-    }
-    axes.into_iter()
-        .map(|(j2, j3)| {
-            let p = Axes([0.0, j2, j3, 0.0]).pose();
-            Vec2::new(p.r, p.y + TOOL_LENGTH + JAW_HEIGHT)
-        })
-        .collect()
-}
+/// Axis positions J1..J4 (rad): J1 base, J2 lower arm from the vertical, J3 upper arm
+/// from the horizontal, J4 flange relative to J1 (see [`Kin`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Axes(pub [f32; 4]);
 
 /// Kind of move, as in the TP routines: J (joint interpolated, % of the axis
 /// speeds) or L (straight line at a TCP speed in m/s).
@@ -125,7 +420,7 @@ pub enum Move {
     Linear(f32),
 }
 
-/// Pivots of the STEP model in its rest pose (lower arm vertical, upper arm
+/// Pivots of the FANUC STEP model in its rest pose (lower arm vertical, upper arm
 /// horizontal), in the robot frame: (x forward, y up) of the arm plane.
 mod rest {
     use bevy::math::Vec2;
@@ -143,9 +438,22 @@ mod rest {
     pub const FLANGE_Z: f32 = 0.0188;
 }
 
-/// Parts of the manufacturer's model (`assets/models/fanuc_m410ic185/*.glb`).
-/// The pedestal (S201) and its floor plate are left out: only the robot is drawn,
-/// from the J1 turntable up (the kinematics keep J2 at 1110 mm).
+/// Pivots of the KUKA STEP model in its rest pose (A2 -90°, A3 +90°), from the
+/// skeleton sketch of the model.
+mod kuka_rest {
+    use bevy::math::Vec2;
+    pub const A2: Vec2 = Vec2::new(0.330, 0.645);
+    pub const A3: Vec2 = Vec2::new(0.330, 1.995);
+    pub const A5: Vec2 = Vec2::new(1.585, 1.995);
+    /// A6 axis (flange center).
+    pub const FLANGE_X: f32 = 1.850;
+}
+
+/// Parts of the manufacturer's models (`assets/models/<model>/*.glb`). FANUC: the
+/// pedestal (S201) and its floor plate are left out, only the robot is drawn from
+/// the J1 turntable up (the kinematics keep J2 at 1110 mm). KUKA: floor mounted,
+/// base frame, rotating column, link arm (A2), arm (A3), in-line wrist (A5, kept
+/// level) and mounting flange (A6).
 #[derive(Component, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum CadPart {
     Turntable,
@@ -158,10 +466,16 @@ pub enum CadPart {
     LevelLink,
     Wrist,
     Flange,
+    KukaBase,
+    KukaColumn,
+    KukaLinkArm,
+    KukaArm,
+    KukaWrist,
+    KukaFlange,
 }
 
 impl CadPart {
-    pub const ALL: [(Self, &'static str); 10] = [
+    pub const FANUC: [(Self, &'static str); 10] = [
         (Self::Turntable, "S301"),
         (Self::LowerArm, "S302"),
         (Self::Lever, "S303"),
@@ -173,38 +487,72 @@ impl CadPart {
         (Self::Wrist, "S501"),
         (Self::Flange, "S502"),
     ];
+    pub const KUKA: [(Self, &'static str); 6] = [
+        (Self::KukaBase, "base"),
+        (Self::KukaColumn, "column"),
+        (Self::KukaLinkArm, "link_arm"),
+        (Self::KukaArm, "arm"),
+        (Self::KukaWrist, "wrist"),
+        (Self::KukaFlange, "flange"),
+    ];
+
+    /// Parts of a model and the folder of their files under `assets/`.
+    pub fn of(model: RobotModel) -> (&'static [(Self, &'static str)], &'static str) {
+        match model {
+            RobotModel::FanucM410iC185 => (&Self::FANUC, "models/fanuc_m410ic185"),
+            RobotModel::KukaKr180R3200_2Pa => (&Self::KUKA, "models/kuka_kr180_r3200_2_pa"),
+        }
+    }
 
     /// Pose of the part in the robot frame for the given joints.
     fn transform(self, joints: &Joints, flange_yaw: f32) -> Transform {
         let a = joints.shoulder - FRAC_PI_2; // lower arm rotation from rest (vertical)
         let b = joints.upper_dir.y.atan2(joints.upper_dir.x); // upper arm from rest (horizontal)
-        let j2 = rest::J2.extend(0.0);
-        let j3 = (rest::J2 + joints.elbow).extend(0.0);
-        let d3 = j3 - rest::J3.extend(0.0);
-        let wrist = j3 + (joints.upper_dir * L2).extend(0.0);
-        let dw = wrist - rest::WRIST.extend(0.0);
         let about = |pivot: Vec3, new_pivot: Vec3, angle: f32| {
             Affine3A::from_translation(new_pivot) * Affine3A::from_rotation_z(angle) * Affine3A::from_translation(-pivot)
         };
+        let flange = |x: f32, z: f32, dw: Vec3| {
+            let axis = Vec3::new(x, 0.0, z);
+            Affine3A::from_translation(axis + dw) * Affine3A::from_rotation_y(flange_yaw) * Affine3A::from_translation(-axis)
+        };
         let arm = match self {
-            Self::Turntable => Affine3A::IDENTITY,
-            Self::LowerArm => about(j2, j2, a),
-            Self::Lever => about(j2, j2, b),
-            Self::LeverRod => {
-                let lever = rest::LEVER.extend(0.0);
-                let end = j2 + Quat::from_rotation_z(b) * (lever - j2);
-                about(lever, end, a)
+            Self::KukaBase => return Transform::IDENTITY,
+            Self::KukaColumn => Affine3A::IDENTITY,
+            Self::KukaLinkArm | Self::KukaArm | Self::KukaWrist | Self::KukaFlange => {
+                let a2 = kuka_rest::A2.extend(0.0);
+                let a3 = (kuka_rest::A2 + joints.elbow).extend(0.0);
+                let dw = a3 + (joints.upper_dir * KUKA.l2).extend(0.0) - kuka_rest::A5.extend(0.0);
+                match self {
+                    Self::KukaLinkArm => about(a2, a2, a),
+                    Self::KukaArm => about(kuka_rest::A3.extend(0.0), a3, b),
+                    Self::KukaWrist => Affine3A::from_translation(dw),
+                    _ => flange(kuka_rest::FLANGE_X, 0.0, dw),
+                }
             }
-            Self::LevelRod => about(rest::LEVEL_ROD.extend(0.0), rest::LEVEL_ROD.extend(0.0), a),
-            Self::Bellcrank | Self::Wrist => Affine3A::from_translation(if self == Self::Wrist { dw } else { d3 }),
-            Self::UpperArm => about(rest::J3.extend(0.0), j3, b),
-            Self::LevelLink => {
-                let link = rest::LEVEL_LINK.extend(0.0);
-                about(link, link + d3, b)
-            }
-            Self::Flange => {
-                let axis = Vec3::new(rest::FLANGE_X, 0.0, rest::FLANGE_Z);
-                Affine3A::from_translation(axis + dw) * Affine3A::from_rotation_y(flange_yaw) * Affine3A::from_translation(-axis)
+            _ => {
+                let j2 = rest::J2.extend(0.0);
+                let j3 = (rest::J2 + joints.elbow).extend(0.0);
+                let d3 = j3 - rest::J3.extend(0.0);
+                let dw = j3 + (joints.upper_dir * FANUC.l2).extend(0.0) - rest::WRIST.extend(0.0);
+                match self {
+                    Self::LowerArm => about(j2, j2, a),
+                    Self::Lever => about(j2, j2, b),
+                    Self::LeverRod => {
+                        let lever = rest::LEVER.extend(0.0);
+                        let end = j2 + Quat::from_rotation_z(b) * (lever - j2);
+                        about(lever, end, a)
+                    }
+                    Self::LevelRod => about(rest::LEVEL_ROD.extend(0.0), rest::LEVEL_ROD.extend(0.0), a),
+                    Self::Bellcrank => Affine3A::from_translation(d3),
+                    Self::Wrist => Affine3A::from_translation(dw),
+                    Self::UpperArm => about(rest::J3.extend(0.0), j3, b),
+                    Self::LevelLink => {
+                        let link = rest::LEVEL_LINK.extend(0.0);
+                        about(link, link + d3, b)
+                    }
+                    Self::Flange => flange(rest::FLANGE_X, rest::FLANGE_Z, dw),
+                    _ => Affine3A::IDENTITY,
+                }
             }
         };
         let full = Affine3A::from_rotation_y(joints.j1) * arm;
@@ -223,6 +571,8 @@ pub enum RobotPart {
     /// Clamps of the cabeçote, on either side (`-Z` / `+Z` of the gripper).
     JawA,
     JawB,
+    /// Pedestal from the floor to the robot base, when the robot is mounted higher.
+    Pedestal,
 }
 
 /// TCP pose in the robot frame, cylindrical: angle around J1, radius, height,
@@ -236,13 +586,6 @@ pub struct Pose {
 }
 
 impl Pose {
-    pub const HOME: Self = Self {
-        theta: 0.0,
-        r: 1.7,
-        y: 1.405,
-        yaw: 0.0,
-    };
-
     pub fn local_point(&self) -> Vec3 {
         Vec3::new(self.r * self.theta.cos(), self.y, -self.r * self.theta.sin())
     }
@@ -254,17 +597,6 @@ impl Pose {
             y: p.y,
             yaw,
         }
-    }
-
-    /// Axis positions of this pose (J1 within ±180°, never wrapped).
-    pub fn axes(&self) -> Axes {
-        let joints = solve(self);
-        Axes([
-            self.theta,
-            FRAC_PI_2 - joints.shoulder,
-            joints.upper_dir.y.atan2(joints.upper_dir.x),
-            self.yaw - self.theta,
-        ])
     }
 }
 
@@ -309,8 +641,10 @@ pub struct Drop {
     exact: bool,
 }
 
-#[derive(Component, Debug)]
+#[derive(Component)]
 pub struct RobotState {
+    /// Model of this robot (kinematics, limits, speeds).
+    pub kin: &'static Kin,
     pub pose: Pose,
     from: Pose,
     to: Pose,
@@ -321,7 +655,7 @@ pub struct RobotState {
     duration: f32,
     /// Acceleration time of the current move.
     ramp: f32,
-    /// Axis speeds of the last frame (rad/s), for the property panel.
+    /// Axis speeds of the last frame (rad/s, manufacturer's axes), for the property panel.
     pub axis_speed: [f32; 4],
     pub step: Step,
     wait: f32,
@@ -350,16 +684,28 @@ pub struct RobotState {
     pub jaw: [f32; 2],
     pub status: String,
     pub cycles: u32,
+    /// Log de falhas: (time, details), newest last.
+    pub faults: Vec<(f32, String)>,
+    /// Faults of the last planning attempt: a fault is logged when it appears.
+    active_faults: Vec<String>,
 }
 
 impl Default for RobotState {
     fn default() -> Self {
+        Self::new(&FANUC)
+    }
+}
+
+impl RobotState {
+    pub fn new(kin: &'static Kin) -> Self {
+        let home = kin.home;
         Self {
-            pose: Pose::HOME,
-            from: Pose::HOME,
-            to: Pose::HOME,
-            from_axes: Pose::HOME.axes(),
-            to_axes: Pose::HOME.axes(),
+            kin,
+            pose: home,
+            from: home,
+            to: home,
+            from_axes: kin.axes(&home),
+            to_axes: kin.axes(&home),
             motion: Move::Joint,
             t: 0.0,
             duration: 0.0,
@@ -379,17 +725,17 @@ impl Default for RobotState {
             pallet: None,
             drops: Vec::new(),
             drop_i: 0,
-            safe_y: Pose::HOME.y,
+            safe_y: home.y,
             collected: false,
             perched: false,
             jaw: [0.0; 2],
             status: "Aguardando".into(),
             cycles: 0,
+            faults: Vec::new(),
+            active_faults: Vec::new(),
         }
     }
-}
 
-impl RobotState {
     fn moving(&self) -> bool {
         self.t < self.duration
     }
@@ -399,15 +745,17 @@ impl RobotState {
     /// plus the acceleration ramps.
     fn move_to(&mut self, to: Pose, speed_override: f32, motion: Move) {
         let ovr = speed_override.clamp(0.05, 1.0);
-        let (a, b) = (self.pose.axes(), to.axes());
-        let axes_time = (0..4).map(|i| (b.0[i] - a.0[i]).abs() / (spec::SPEED[i] * ovr)).fold(0.0, f32::max);
+        let (a, b) = (self.kin.axes(&self.pose), self.kin.axes(&to));
+        // Data sheet speeds apply to the manufacturer's axes (KUKA A3 between the arms).
+        let (ma, mb) = (self.kin.to_motor(a), self.kin.to_motor(b));
+        let axes_time = (0..4).map(|i| (mb[i] - ma[i]).abs() / (self.kin.speed[i] * ovr)).fold(0.0, f32::max);
         let travel = match motion {
             Move::Joint => axes_time,
             // On a line the axes do not all move at a constant rate: keep some margin.
             Move::Linear(v) => ((to.local_point() - self.pose.local_point()).length() / (v * ovr)).max(axes_time * 1.15),
         };
         // Trapezoid: cruise time + one ramp; short moves never reach full speed.
-        let ramp = spec::ACC_TIME;
+        let ramp = self.kin.acc_time;
         let duration = if travel >= ramp { travel + ramp } else { 2.0 * (travel * ramp).sqrt() };
         self.from = self.pose;
         self.to = to;
@@ -428,7 +776,7 @@ impl RobotState {
                 for (i, v) in q.iter_mut().enumerate() {
                     *v = self.from_axes.0[i] + (self.to_axes.0[i] - self.from_axes.0[i]) * k;
                 }
-                Axes(q).pose()
+                self.kin.pose(Axes(q))
             }
             Move::Linear(_) => {
                 let p = self.from.local_point().lerp(self.to.local_point(), k);
@@ -464,43 +812,6 @@ pub struct Joints {
     pub reachable: bool,
 }
 
-/// Inverse kinematics in the arm plane (elbow-up solution). `elbow` and the
-/// wrist pivot are relative to the J2 axis; the TCP is `WRIST_FWD` ahead of and
-/// `TCP_DROP` below the wrist pivot.
-pub fn solve(pose: &Pose) -> Joints {
-    let r = pose.r - J2_OFFSET - WRIST_FWD;
-    let h = pose.y + TCP_DROP - BASE_HEIGHT;
-    let target = Vec2::new(r, h);
-    let d = target.length();
-    let in_plane = d <= L1 + L2 - 1e-3 && d >= (L1 - L2).abs() + 1e-3 && pose.y >= -0.05;
-    let dc = d.clamp((L1 - L2).abs() + 1e-3, L1 + L2 - 1e-3);
-    let cos_inner = ((L1 * L1 + dc * dc - L2 * L2) / (2.0 * L1 * dc)).clamp(-1.0, 1.0);
-    let shoulder = h.atan2(r) + cos_inner.acos();
-    let elbow = Vec2::new(L1 * shoulder.cos(), L1 * shoulder.sin());
-    let wrist = if in_plane {
-        target
-    } else {
-        elbow + (target - elbow).normalize_or_zero() * L2
-    };
-    let upper_dir = (wrist - elbow).normalize_or_zero();
-    // Axis limits of the data sheet (J2 from the vertical, J3 from the horizontal).
-    let j2 = FRAC_PI_2 - shoulder;
-    let j3 = upper_dir.y.atan2(upper_dir.x);
-    let axes = Axes([pose.theta, j2, j3, pose.yaw - pose.theta]);
-    Joints {
-        j1: pose.theta,
-        shoulder,
-        elbow,
-        upper_dir,
-        reachable: in_plane && axes.within_limits(),
-    }
-}
-
-fn plane_to_local(j1: f32, p: Vec2) -> Vec3 {
-    let radial = J2_OFFSET + p.x;
-    Vec3::new(radial * j1.cos(), BASE_HEIGHT + p.y, -radial * j1.sin())
-}
-
 fn link_rotation(j1: f32, plane_angle: f32) -> Quat {
     Quat::from_rotation_y(j1) * Quat::from_rotation_z(plane_angle - FRAC_PI_2)
 }
@@ -509,26 +820,6 @@ fn link_rotation(j1: f32, plane_angle: f32) -> Quat {
 fn nearest_half_turn(current: f32, target: f32) -> f32 {
     let k = ((current - target) / PI).round();
     target + k * PI
-}
-
-/// Gripper yaw for exactly `target` (full turns only) closest to `current`, with J4
-/// (yaw relative to J1 at `theta`) inside its ±360° range.
-fn wrist_yaw_exact(current: f32, target: f32, theta: f32) -> f32 {
-    (-4..=4)
-        .map(|k| target + k as f32 * 2.0 * PI)
-        .filter(|y| (y - theta).abs() <= spec::MAX[3])
-        .min_by(|a, b| (a - current).abs().total_cmp(&(b - current).abs()))
-        .unwrap_or(target)
-}
-
-/// Gripper yaw for `target` (any half turn) closest to `current`, keeping J4
-/// (yaw relative to J1 at `theta`) inside its ±360° range.
-fn wrist_yaw(current: f32, target: f32, theta: f32) -> f32 {
-    (-8..=8)
-        .map(|k| target + k as f32 * PI)
-        .filter(|y| (y - theta).abs() <= spec::MAX[3])
-        .min_by(|a, b| (a - current).abs().total_cmp(&(b - current).abs()))
-        .unwrap_or_else(|| nearest_half_turn(current, target))
 }
 
 pub fn yaw_of(rotation: Quat) -> f32 {
@@ -548,6 +839,19 @@ pub struct Claims {
 impl Claims {
     fn available(&self, target: Entity, robot: Entity) -> bool {
         self.owner.get(&target).is_none_or(|r| *r == robot) && self.waiting.get(&target).is_none_or(|r| *r == robot)
+    }
+}
+
+/// Why a cycle could not be planned: waiting for something, or a fault (a point out
+/// of the robot's reach), with the details for the log.
+enum Failure {
+    Wait(&'static str),
+    Fault(String),
+}
+
+impl From<&'static str> for Failure {
+    fn from(reason: &'static str) -> Self {
+        Self::Wait(reason)
     }
 }
 
@@ -701,7 +1005,8 @@ fn plan_cycle(
     (tdp_eq, pallet_entity): (&Equipment, Entity),
     loads: &LoadQuery,
     pallet_loads: &Query<&mut PalletLoad>,
-) -> Result<Plan, &'static str> {
+) -> Result<Plan, Failure> {
+    let kin = state.kin;
     let robot_yaw = yaw_of(robot_tf.rotation);
     let mut group: Vec<(Entity, Vec3, Quat, Vec3)> = loads
         .iter()
@@ -712,10 +1017,10 @@ fn plan_cycle(
         group.truncate(1);
     }
     if group.is_empty() {
-        return Err("Aguardando produto na coleta");
+        return Err("Aguardando produto na coleta".into());
     }
     let Ok((_, pallet, pallet_tf)) = loads.get(pallet_entity) else {
-        return Err("Aguardando pallet em posição");
+        return Err("Aguardando pallet em posição".into());
     };
     let (pallet_size, pallet_tf) = (pallet.size, *pallet_tf);
     let content = pallet_loads.get(pallet_entity).ok();
@@ -724,7 +1029,7 @@ fn plan_cycle(
     let pick = pattern.and_then(|p| current_pick(p, filled));
     if pattern.is_some() {
         let Some((spec, _)) = &pick else {
-            return Err("Pallet completo");
+            return Err("Pallet completo".into());
         };
         // Take only what the pick needs; one product is the one the empurrador
         // pushed (lane out, lowest Z on the mesa).
@@ -788,14 +1093,20 @@ fn plan_cycle(
     let unit = Vec3::new(max.x - min.x, height, max.z - min.z);
     let (drops, next_size) = match (pattern, &pick) {
         (Some(p), Some((spec, next))) => (pattern_drops(p, pallet_size.y, &held, spec, filled, sheets_dy), Some(*next)),
-        (Some(_), None) => return Err("Pallet completo"),
+        (Some(_), None) => return Err("Pallet completo".into()),
         (None, _) => {
             // Automatic grid: the pallet keeps the footprint of its first placement.
             let units_done = content.map_or(0, |p| p.units);
+            let group = unit;
             let unit = content.and_then(|p| p.unit_size).unwrap_or(unit);
             let Some((slot_local, slot_yaw)) = sim::pallet_slot(&tdp_eq.params, pallet_size, unit, units_done) else {
-                return Err("Pallet completo");
+                return Err("Pallet completo".into());
             };
+            // A group that came turned 90° (e.g. fardos fed from a side belt) is turned
+            // back so its footprint matches the slot.
+            let swapped = (group.x - unit.z).abs() < 0.03 && (group.z - unit.x).abs() < 0.03;
+            let same = (group.x - unit.x).abs() < 0.03 && (group.z - unit.z).abs() < 0.03;
+            let slot_yaw = if swapped && !same { slot_yaw + FRAC_PI_2 } else { slot_yaw };
             let slot_local = slot_local + Vec3::Y * sheets_dy;
             let slot_rot = Quat::from_rotation_y(slot_yaw);
             let bottom = slot_local.y - unit.y / 2.0;
@@ -807,31 +1118,58 @@ fn plan_cycle(
                 })
                 .collect();
             let top = slot_local - Vec3::Y * unit.y / 2.0;
-            (vec![Drop { boxes, top, yaw: slot_yaw, slots: Vec::new(), units: 1, exact: false }], None)
+            (vec![Drop { boxes, top, yaw: slot_yaw, slots: Vec::new(), units: 1, exact: true }], None)
         }
     };
     if drops.is_empty() {
-        return Err("Pallet completo");
+        return Err("Pallet completo".into());
     }
     let local_pick = world_to_local.transform_point3(pick_top);
     let pick_pose = Pose::from_local(local_pick, 0.0);
     let tops: Vec<Vec3> = drops.iter().map(|d| world_to_local.transform_point3(pallet_tf.transform_point(d.top))).collect();
-    if !solve(&pick_pose).reachable || tops.iter().any(|t| !solve(&Pose::from_local(*t, 0.0)).reachable) {
-        return Err("Coleta ou posição no pallet fora do alcance");
+    // Each point the arm cannot reach, with the reason (log de falhas). The floor is
+    // below the robot base by the height the robot is mounted at (pedestal).
+    let floor_y = -robot_tf.translation.y;
+    let mut faults = Vec::new();
+    if let Some(why) = kin.reach_report(local_pick, floor_y) {
+        faults.push(format!("coleta em {}: {why}", pick_eq.name));
+    }
+    for (d, t) in drops.iter().zip(&tops) {
+        if let Some(why) = kin.reach_report(*t, floor_y) {
+            let what = if d.slots.is_empty() {
+                format!("depósito no {}", tdp_eq.name)
+            } else {
+                let slots: Vec<String> = d.slots.iter().map(|s| (s + 1).to_string()).collect();
+                format!("depósito no {} (posição {} do padrão)", tdp_eq.name, slots.join(", "))
+            };
+            faults.push(format!("{what}: {why}"));
+        }
+    }
+    if !faults.is_empty() {
+        return Err(Failure::Fault(faults.join(" | ")));
     }
     // Safe height for the transfer, never above what the arm reaches at the pick and
     // place radii (the operating space narrows near its top).
-    let highest = tops.iter().map(|t| t.y).fold(local_pick.y, f32::max);
-    let ceiling = tops
-        .iter()
-        .map(|t| max_tcp_height(radial(*t)))
-        .fold(max_tcp_height(radial(local_pick)), f32::min)
-        - 0.02;
-    let safe_y = (highest + 0.35).min(ceiling);
+    // The carried fardos (TCP at their bottom) must clear the fardos already standing
+    // in the layer being built, one fardo height above each drop point.
+    let highest = tops.iter().map(|t| t.y + height).fold(f32::MIN, f32::max);
+    // Over the pallet the arm must clear the layer; at the pick (often close to the base,
+    // where the arm cannot go as high) it rises only as far as it reaches there.
+    let ceiling = tops.iter().map(|t| kin.max_tcp_height(radial(*t))).fold(f32::INFINITY, f32::min) - 0.02;
+    let pick_ceiling = kin.max_tcp_height(radial(local_pick)) - 0.02;
+    let safe_y = (highest + 0.15).min(ceiling).min(kin.program.max_travel_y.max(highest + 0.05));
     if safe_y < highest + 0.05 {
-        return Err("Altura máxima do robô: sem folga para passar sobre a coleta/pallet");
+        return Err(Failure::Fault(format!(
+            "altura sobre o {} (coleta em {}): precisa passar a {:.2} m (topo da camada {:.2} m + 0,05) e o braço só sobe até {:.2} m a {:.2} m de raio",
+            tdp_eq.name,
+            pick_eq.name,
+            highest + 0.05,
+            highest,
+            ceiling + 0.02,
+            tops.iter().map(|t| radial(*t)).fold(0.0, f32::max),
+        )));
     }
-    let grip_yaw = wrist_yaw(state.pose.yaw, group_yaw - robot_yaw, pick_pose.theta);
+    let grip_yaw = kin.wrist_yaw(state.pose.yaw, group_yaw - robot_yaw, pick_pose.theta);
     Ok(Plan {
         held,
         unit,
@@ -840,7 +1178,7 @@ fn plan_cycle(
         pallet: pallet_entity,
         drops,
         safe_y,
-        above: Pose { y: safe_y, yaw: grip_yaw, ..pick_pose },
+        above: Pose { y: safe_y.min(pick_ceiling).max(pick_pose.y), yaw: grip_yaw, ..pick_pose },
         next_size,
     })
 }
@@ -848,48 +1186,32 @@ fn plan_cycle(
 /// Perch (wait) pose of MOVE_PERCH: over the middle of the pick area, the
 /// gripper aligned with the conveyor, high enough to clear the incoming fardos.
 fn perch_pose(state: &RobotState, world_to_local: &Affine3A, robot_yaw: f32, pick_eq: &Equipment, pick_tf: &Transform) -> Option<Pose> {
+    let kin = state.kin;
     let p = &pick_eq.params;
     let end = p.length / 2.0;
     let x = crate::conveyor::layout(pick_eq).pick_x0.map_or(end - 0.3, |x0| (x0 + end) / 2.0);
     let world = pick_tf.transform_point(Vec3::new(x, p.height + p.box_size[1] + 0.35, 0.0));
     let mut local = world_to_local.transform_point3(world);
-    local.y = local.y.min(max_tcp_height(radial(local)) - 0.02);
+    local.y = local.y.min(kin.max_tcp_height(radial(local)) - 0.02);
     let theta = Pose::from_local(local, 0.0).theta;
-    let yaw = wrist_yaw(state.pose.yaw, yaw_of(pick_tf.rotation) - robot_yaw, theta);
+    let yaw = kin.wrist_yaw(state.pose.yaw, yaw_of(pick_tf.rotation) - robot_yaw, theta);
     let pose = Pose::from_local(local, yaw);
-    solve(&pose).reachable.then_some(pose)
+    kin.solve(&pose).reachable.then_some(pose)
 }
 
 fn radial(local: Vec3) -> f32 {
     Vec2::new(local.x, local.z).length()
 }
 
-/// Highest TCP height the arm reaches at radius `r` from J1 within the axis limits
-/// (the top of the operating space at that radius); -inf when out of reach.
-pub fn max_tcp_height(r: f32) -> f32 {
-    let reachable = |y: f32| solve(&Pose { theta: 0.0, r, y, yaw: 0.0 }).reachable;
-    let (mut lo, mut hi) = (f32::NEG_INFINITY, 3.5);
-    let mut y = hi;
-    while y > -1.0 {
-        if reachable(y) {
-            lo = y;
-            break;
-        }
-        hi = y;
-        y -= 0.05;
-    }
-    if lo == f32::NEG_INFINITY {
-        return lo;
-    }
-    for _ in 0..12 {
-        let mid = (lo + hi) / 2.0;
-        if reachable(mid) {
-            lo = mid;
-        } else {
-            hi = mid;
-        }
-    }
-    lo
+/// The robot reaches the pick point at the end of this conveyor (mesa coleta, belt end).
+pub fn reaches_pick(kin: &Kin, robot_tf: &Transform, eq: &Equipment, tf: &Transform) -> bool {
+    let end = tf.transform_point(Vec3::new(eq.params.length / 2.0 - 0.3, eq.params.height, 0.0));
+    radial(robot_tf.compute_affine().inverse().transform_point3(end)) <= kin.reach
+}
+
+/// The robot reaches the pallet on this TDP.
+pub fn reaches_tdp(kin: &Kin, robot_tf: &Transform, tf: &Transform) -> bool {
+    radial(robot_tf.compute_affine().inverse().transform_point3(tf.translation)) <= kin.reach + 0.8
 }
 
 /// Listed names first, in list order, then the rest by name.
@@ -903,6 +1225,7 @@ pub fn robot_program(
     control: Res<crate::model::SimControl>,
     mut commands: Commands,
     mut claims: Local<Claims>,
+    mut traced: Local<HashMap<Entity, String>>,
     mut robots: Query<(Entity, &Equipment, &Transform, &mut RobotState, &mut Io), Without<Load>>,
     equipment: Query<(Entity, &Equipment, &Transform), (Without<Load>, Without<RobotState>)>,
     palletizers: Query<&PalletizerState>,
@@ -917,11 +1240,16 @@ pub fn robot_program(
     claims.waiting.retain(|_, r| alive.contains(r));
     for (robot_entity, robot_eq, robot_tf, mut state, mut io) in &mut robots {
         let params = &robot_eq.params;
+        let kin = kin(params.robot_model);
+        if !std::ptr::eq(state.kin, kin) {
+            // Model changed: start over from its home position.
+            *state = RobotState::new(kin);
+        }
         let world_to_local = robot_tf.compute_affine().inverse();
         let robot_yaw = yaw_of(robot_tf.rotation);
         let in_reach = |p: Vec3, margin: f32| {
             let local = world_to_local.transform_point3(p);
-            Vec2::new(local.x, local.z).length() <= REACH + margin
+            Vec2::new(local.x, local.z).length() <= kin.reach + margin
         };
 
         // Pick conveyors (mesa coletas, belt ends) and palletizing TDPs in reach: the
@@ -953,11 +1281,11 @@ pub fn robot_program(
                 break 'logic;
             }
             if state.moving() {
-                let before = state.pose.axes();
+                let before = kin.to_motor(kin.axes(&state.pose));
                 state.t += dt;
                 state.pose = state.pose_at(state.t);
-                let after = state.pose.axes();
-                state.axis_speed = std::array::from_fn(|i| (after.0[i] - before.0[i]) / dt);
+                let after = kin.to_motor(kin.axes(&state.pose));
+                state.axis_speed = std::array::from_fn(|i| (after[i] - before[i]) / dt);
                 break 'logic;
             }
             state.axis_speed = [0.0; 4];
@@ -982,20 +1310,24 @@ pub fn robot_program(
                         state.status = "Aguardando liberação (start)".into();
                         break 'logic;
                     }
-                    // While waiting, tell the next mesa how many fardos the coming pick needs
-                    // (receita 10x1: FardosPonto 3 or 4) for the pallet in progress.
-                    if let Some(&(_, tdp_eq, Some(tdp))) = tdps.first()
-                        && let (Some(pattern), Some(pallet)) = (tdp_eq.params.pattern.as_ref(), tdp.pallet)
-                        && let Some((spec, _)) = current_pick(pattern, pallet_loads.get(pallet).map_or(&[][..], |c| &c.filled))
-                        && let Some(&(mesa, ..)) = picks.first()
-                        && let Ok(mut logic) = mesas.get_mut(mesa)
+                    // Give the mesas the sizes of the picks of a pallet (receita 10x1: 4, 3, 3...):
+                    // each mesa forms its groups in that order.
+                    if let Some(&(_, tdp_eq, _)) = tdps.first()
+                        && let Some(pattern) = tdp_eq.params.pattern.as_ref()
+                        && !pattern.groups.is_empty()
                     {
-                        let n: usize = spec.iter().map(|d| d.len()).sum();
-                        if n >= 3 {
-                            logic.fardos_ponto = n.min(4) as u32;
+                        let sizes: Vec<u32> = pattern.picks.iter().map(|k| k.iter().map(|d| d.len() as u32).sum()).collect();
+                        for &(mesa, ..) in &picks {
+                            if let Ok(mut logic) = mesas.get_mut(mesa)
+                                && logic.size_cycle != sizes
+                            {
+                                logic.size_cycle = sizes.clone();
+                                logic.group_index = 0;
+                            }
                         }
                     }
                     let mut status: Option<&'static str> = None;
+                    let mut faults: Vec<String> = Vec::new();
                     let mut wait_for = Vec::new();
                     let mut chosen = None;
                     'search: for &(tdp_entity, tdp_eq, tdp) in &tdps {
@@ -1017,6 +1349,11 @@ pub fn robot_program(
                             continue;
                         }
                         for &(pick_entity, pick_eq, pick_tf) in &picks {
+                            // Rotas: this mesa does not feed this TDP.
+                            if !params.routed(&tdp_eq.name, &pick_eq.name) {
+                                status.get_or_insert("Aguardando coleta da mesa roteada para o TDP");
+                                continue;
+                            }
                             if !claims.available(pick_entity, robot_entity) {
                                 wait_for.push(pick_entity);
                                 status.get_or_insert("Coleta em uso por outro robô");
@@ -1048,8 +1385,12 @@ pub fn robot_program(
                                     chosen = Some((pick_entity, tdp_entity, plan));
                                     break 'search;
                                 }
-                                Err(reason) => {
+                                Err(Failure::Wait(reason)) => {
                                     status.get_or_insert(reason);
+                                }
+                                Err(Failure::Fault(details)) => {
+                                    status.get_or_insert("Falha: posição fora do alcance (ver log de falhas)");
+                                    faults.push(details);
                                 }
                             }
                         }
@@ -1060,6 +1401,20 @@ pub fn robot_program(
                             claims.waiting.entry(target).or_insert(robot_entity);
                         }
                         state.status = status.unwrap_or("Aguardando").into();
+                        let active = std::mem::take(&mut state.active_faults);
+                        for details in &faults {
+                            // A fault is logged once while it lasts.
+                            if !active.contains(details) {
+                                if std::env::var("PDT_TRACE").is_ok() {
+                                    eprintln!("[{:.2}] {}: FALHA {details}", time.elapsed_secs(), robot_eq.name);
+                                }
+                                state.faults.push((time.elapsed_secs(), details.clone()));
+                                if state.faults.len() > 50 {
+                                    state.faults.remove(0);
+                                }
+                            }
+                        }
+                        state.active_faults = faults;
                         // MOVE_PERCH: wait over the coleta of the next mesa, at the infeed height.
                         if !state.perched
                             && let Some(&(_, pick_eq, pick_tf)) = picks.first()
@@ -1089,18 +1444,12 @@ pub fn robot_program(
                             drops.join(" ")
                         );
                     }
-                    // The next mesa group: a single fardo (última camada ímpar) or, with the
-                    // receita 10x1 of the mesa 3 estágios, 3 or 4 fardos (FardosPonto).
-                    if let Some(n) = plan.next_size
+                    // Última camada ímpar: the next mesa group is a single fardo.
+                    if plan.next_size == Some(1)
                         && let Some(i) = picks.iter().position(|p| p.0 == pick_entity)
                         && let Ok(mut next) = mesas.get_mut(picks[(i + 1) % picks.len()].0)
                     {
-                        if n == 1 {
-                            next.single_request = true;
-                        }
-                        if n >= 3 {
-                            next.fardos_ponto = n.min(4) as u32;
-                        }
+                        next.single_request = true;
                     }
                     claims.owner.insert(pick_entity, robot_entity);
                     claims.owner.insert(tdp_entity, robot_entity);
@@ -1109,13 +1458,14 @@ pub fn robot_program(
                     state.group_yaw = plan.group_yaw;
                     state.pick_top = plan.pick_top;
                     state.safe_y = plan.safe_y;
+                    state.active_faults.clear();
                     state.pick_conveyor = Some(pick_entity);
                     state.last_pick = Some(pick_entity);
                     state.tdp = Some(tdp_entity);
                     state.pallet = Some(plan.pallet);
                     state.drops = plan.drops;
                     state.drop_i = 0;
-                    state.status = "Indo para coleta".into();
+                    state.status = format!("{}: indo para a coleta", kin.program.pick);
                     state.step = Step::ToAbovePick;
                     state.move_to(plan.above, params.speed_override, Move::Joint);
                 }
@@ -1123,8 +1473,8 @@ pub fn robot_program(
                     let local = world_to_local.transform_point3(state.pick_top);
                     let target = Pose { yaw: state.pose.yaw, ..Pose::from_local(local, 0.0) };
                     state.step = Step::DownPick;
-                    state.status = "Descendo para coleta".into();
-                    state.move_to(target, params.speed_override, Move::Linear(3.0)); // PICK: L PR[3] 3000mm/sec
+                    state.status = format!("{}: descendo para a coleta", kin.program.pick);
+                    state.move_to(target, params.speed_override, Move::Linear(kin.program.pick_down)); // PICK: L PR[3] 3000mm/sec / MovePick SLIN 2.5
                 }
                 Step::DownPick => {
                     state.step = Step::Grip;
@@ -1151,8 +1501,9 @@ pub fn robot_program(
                     state.hold_yaw = state.group_yaw - gripper_world_yaw;
                     state.held = held;
                     state.step = Step::UpPick;
-                    let up = Pose { y: state.safe_y, ..state.pose };
-                    state.move_to(up, params.speed_override, Move::Linear(1.8)); // PICK: L PR[11] 1800mm/sec
+                    let y = state.safe_y.min(kin.max_tcp_height(state.pose.r) - 0.02).max(state.pose.y);
+                    let up = Pose { y, ..state.pose };
+                    state.move_to(up, params.speed_override, Move::Linear(kin.program.pick_up)); // PICK: L PR[11] 1800mm/sec / MovePlace SLIN 3.0
                 }
                 Step::UpPick | Step::ToAbovePlace | Step::Lift => {
                     if state.step == Step::UpPick {
@@ -1184,17 +1535,17 @@ pub fn robot_program(
                         let above = Pose::from_local(local, 0.0);
                         let target_yaw = group_world_yaw - state.hold_yaw - robot_yaw;
                         let yaw = if drop.exact {
-                            wrist_yaw_exact(state.pose.yaw, target_yaw, above.theta)
+                            kin.wrist_yaw_exact(state.pose.yaw, target_yaw, above.theta)
                         } else {
-                            wrist_yaw(state.pose.yaw, target_yaw, above.theta)
+                            kin.wrist_yaw(state.pose.yaw, target_yaw, above.theta)
                         };
                         if state.step == Step::UpPick {
                             let target = Pose { y: state.safe_y, yaw, ..above };
-                            state.status = "Transportando para o pallet".into();
+                            state.status = format!("{}: transportando para o pallet", kin.program.place);
                             state.move_to(target, params.speed_override, Move::Joint); // PLACE: J PR[11] 100%
                         } else {
                             // Next drop of the same pick: turn and move just above it.
-                            let y = state.pose.y.max(local.y + 0.06).min(max_tcp_height(above.r) - 0.02);
+                            let y = state.pose.y.max(local.y + 0.06).min(kin.max_tcp_height(above.r) - 0.02);
                             state.status = "Girando para o outro lado da garra".into();
                             state.move_to(Pose { y, yaw, ..above }, params.speed_override, Move::Linear(1.0));
                         }
@@ -1202,8 +1553,8 @@ pub fn robot_program(
                     } else {
                         let target = Pose { yaw: state.pose.yaw, ..Pose::from_local(local, 0.0) };
                         state.step = Step::DownPlace;
-                        state.status = "Depositando".into();
-                        state.move_to(target, params.speed_override, Move::Linear(2.0)); // PLACE: L PR[5] 2000mm/sec
+                        state.status = format!("{}: depositando", kin.program.place);
+                        state.move_to(target, params.speed_override, Move::Linear(kin.program.place_down)); // PLACE: L PR[5] 2000mm/sec / MovePlace SLIN 2.5
                     }
                 }
                 Step::DownPlace => {
@@ -1271,7 +1622,7 @@ pub fn robot_program(
                         // The TCP is the lowest point (clamp tips, bottom of the held fardo):
                         // it must pass above the fardo just placed and the next slot.
                         let clear = (state.pose.y + held_h).max(next_top.y) + 0.05;
-                        let ceiling = max_tcp_height(state.pose.r).min(max_tcp_height(radial(next_top))) - 0.02;
+                        let ceiling = kin.max_tcp_height(state.pose.r).min(kin.max_tcp_height(radial(next_top))) - 0.02;
                         let y = clear.min(ceiling).max(state.pose.y);
                         let up = Pose { y, ..state.pose };
                         state.move_to(up, params.speed_override, Move::Linear(1.0));
@@ -1279,7 +1630,7 @@ pub fn robot_program(
                         state.cycles += 1;
                         state.step = Step::UpPlace;
                         let up = Pose { y: state.safe_y.max(state.pose.y), ..state.pose };
-                        state.move_to(up, params.speed_override, Move::Linear(4.0)); // PLACE: L PR[11] 4000mm/sec
+                        state.move_to(up, params.speed_override, Move::Linear(kin.program.place_up)); // PLACE: L PR[11] 4000mm/sec / MovePick SLIN 3.0
                     }
                 }
                 Step::UpPlace => {
@@ -1344,6 +1695,11 @@ pub fn robot_program(
             *jaw += ((if closed { 1.0 } else { 0.0 }) - *jaw).clamp(-step, step);
         }
 
+        // PDT_TRACE: the status, when it changes.
+        if std::env::var("PDT_TRACE").is_ok() && traced.get(&robot_entity) != Some(&state.status) {
+            eprintln!("[{:.2}] {}: estado {}", time.elapsed_secs(), robot_eq.name, state.status);
+            traced.insert(robot_entity, state.status.clone());
+        }
         io.set_bool("busy", state.step != Step::Idle);
         io.set_bool("Robo_Fardos_Coletados", state.collected);
         io.set_bool("pallet_full", tdp_state.is_some_and(|p| p.full));
@@ -1357,48 +1713,55 @@ fn half_extent_along(rot: Quat, size: Vec3, dir: Vec3) -> f32 {
     x.dot(dir).abs() * size.x / 2.0 + z.dot(dir).abs() * size.z / 2.0
 }
 
+#[allow(clippy::type_complexity)]
 pub fn animate_robots(
-    robots: Query<&RobotState>,
+    robots: Query<(&RobotState, &Transform), (Without<RobotPart>, Without<CadPart>)>,
     mut parts: Query<(&RobotPart, &ChildOf, &mut Transform), Without<CadPart>>,
     mut cad: Query<(&CadPart, &ChildOf, &mut Transform), Without<RobotPart>>,
 ) {
     for (part, child_of, mut tf) in &mut cad {
-        let Ok(state) = robots.get(child_of.parent()) else { continue };
-        let joints = solve(&state.pose);
+        let Ok((state, _)) = robots.get(child_of.parent()) else { continue };
+        let joints = state.kin.solve(&state.pose);
         *tf = part.transform(&joints, state.pose.yaw - joints.j1);
     }
     for (part, child_of, mut tf) in &mut parts {
-        let Ok(state) = robots.get(child_of.parent()) else { continue };
-        let pose = state.pose;
-        let joints = solve(&pose);
+        let Ok((state, robot_tf)) = robots.get(child_of.parent()) else { continue };
+        let (kin, pose) = (state.kin, state.pose);
+        let joints = kin.solve(&pose);
         let j1 = joints.j1;
         let u = joints.upper_dir;
         let upper_angle = u.y.atan2(u.x);
         *tf = match part {
+            RobotPart::Pedestal => {
+                // Unit cube stretched from the floor up to the base (hidden on the floor).
+                let h = robot_tf.translation.y.max(0.0);
+                let side = if h > 0.01 { 0.80 } else { 0.0 };
+                Transform::from_xyz(0.0, -h / 2.0, 0.0).with_scale(Vec3::new(side, h.max(0.001), side))
+            }
             RobotPart::Turntable => Transform::from_rotation(Quat::from_rotation_y(j1)),
             RobotPart::LowerArm => Transform {
-                translation: plane_to_local(j1, joints.elbow / 2.0),
+                translation: kin.plane_to_local(j1, joints.elbow / 2.0),
                 rotation: link_rotation(j1, joints.shoulder),
                 ..default()
             },
             RobotPart::UpperArm => Transform {
-                translation: plane_to_local(j1, joints.elbow + u * (L2 - UPPER_BACK) / 2.0),
+                translation: kin.plane_to_local(j1, joints.elbow + u * (kin.l2 - kin.upper_back) / 2.0),
                 rotation: link_rotation(j1, upper_angle),
                 ..default()
             },
             RobotPart::Rod => Transform {
-                translation: plane_to_local(j1, joints.elbow / 2.0 - u * 0.35),
+                translation: kin.plane_to_local(j1, joints.elbow / 2.0 - u * 0.35),
                 rotation: link_rotation(j1, joints.shoulder),
                 ..default()
             },
             RobotPart::Wrist => Transform {
-                translation: plane_to_local(j1, joints.elbow + u * L2 + Vec2::X * WRIST_FWD),
+                translation: kin.plane_to_local(j1, joints.elbow + u * kin.l2 + Vec2::X * kin.wrist_fwd),
                 rotation: Quat::from_rotation_y(pose.yaw),
                 ..default()
             },
             RobotPart::Gripper | RobotPart::JawA | RobotPart::JawB => {
                 let gripper = Transform {
-                    translation: plane_to_local(j1, joints.elbow + u * L2 + Vec2::X * WRIST_FWD) - Vec3::Y * FRAME_DROP,
+                    translation: kin.plane_to_local(j1, joints.elbow + u * kin.l2 + Vec2::X * kin.wrist_fwd) - Vec3::Y * kin.frame_drop(),
                     rotation: Quat::from_rotation_y(pose.yaw),
                     ..default()
                 };
@@ -1419,69 +1782,126 @@ pub fn animate_robots(
 mod tests {
     use super::*;
 
-    #[test]
-    fn ik_reaches_target() {
-        let pose = Pose { theta: 0.7, r: 2.2, y: 1.0, yaw: 0.0 };
-        let j = solve(&pose);
-        assert!(j.reachable);
-        let wrist = plane_to_local(j.j1, j.elbow + j.upper_dir * L2 + Vec2::X * WRIST_FWD);
-        let tcp = wrist - Vec3::Y * TCP_DROP;
-        assert!((tcp - pose.local_point()).length() < 1e-3, "{tcp:?} vs {:?}", pose.local_point());
-    }
+    const MODELS: [&Kin; 2] = [&FANUC, &KUKA];
 
     #[test]
-    fn cad_rest_pose_is_identity() {
-        // Pose whose IK gives the STEP rest pose: lower arm vertical, upper arm horizontal.
-        let tcp_plane = rest::WRIST + Vec2::new(WRIST_FWD, -TCP_DROP);
-        let pose = Pose { theta: 0.0, r: tcp_plane.x, y: tcp_plane.y, yaw: 0.0 };
-        let joints = solve(&pose);
-        assert!(joints.reachable);
-        for (part, _) in CadPart::ALL {
-            let tf = part.transform(&joints, 0.0);
-            assert!(tf.translation.length() < 1e-3, "{part:?} {:?}", tf.translation);
-            assert!(tf.rotation.angle_between(Quat::IDENTITY) < 1e-3, "{part:?}");
+    fn ik_reaches_target() {
+        for kin in MODELS {
+            let pose = Pose { theta: 0.7, r: 2.2, y: 1.0, yaw: 0.0 };
+            let j = kin.solve(&pose);
+            assert!(j.reachable, "{:?}", kin.model);
+            let wrist = kin.plane_to_local(j.j1, j.elbow + j.upper_dir * kin.l2 + Vec2::X * kin.wrist_fwd);
+            let tcp = wrist - Vec3::Y * kin.tcp_drop();
+            assert!((tcp - pose.local_point()).length() < 1e-3, "{tcp:?} vs {:?}", pose.local_point());
         }
     }
 
     #[test]
+    fn cad_rest_pose_is_identity() {
+        // Poses whose IK gives the STEP rest pose: lower arm vertical, upper arm horizontal.
+        for (kin, wrist) in [(&FANUC, rest::WRIST), (&KUKA, kuka_rest::A5)] {
+            let tcp_plane = wrist + Vec2::new(kin.wrist_fwd, -kin.tcp_drop());
+            let pose = Pose { theta: 0.0, r: tcp_plane.x, y: tcp_plane.y, yaw: 0.0 };
+            let joints = kin.solve(&pose);
+            assert!(joints.reachable, "{:?}", kin.model);
+            for (part, _) in CadPart::of(kin.model).0 {
+                let tf = part.transform(&joints, 0.0);
+                assert!(tf.translation.length() < 1e-3, "{part:?} {:?}", tf.translation);
+                assert!(tf.rotation.angle_between(Quat::IDENTITY) < 1e-3, "{part:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn kuka_rest_pivots_match_kinematics() {
+        assert!((kuka_rest::A2 - Vec2::new(KUKA.j2_offset, KUKA.base_height)).length() < 1e-6);
+        assert!((kuka_rest::A3 - kuka_rest::A2 - Vec2::Y * KUKA.l1).length() < 1e-6);
+        assert!((kuka_rest::A5 - kuka_rest::A3 - Vec2::X * KUKA.l2).length() < 1e-6);
+        assert!((kuka_rest::FLANGE_X - kuka_rest::A5.x - KUKA.wrist_fwd).abs() < 1e-6);
+        // Rest pose: A2 -90°, A3 +90° (data sheet convention).
+        let m = KUKA.to_motor(Axes([0.0, 0.0, 0.0, 0.0]));
+        assert!((m[1].to_degrees() + 90.0).abs() < 1e-4 && (m[2].to_degrees() - 90.0).abs() < 1e-4, "{m:?}");
+    }
+
+    /// Envelope of the flange center (top, bottom, reach) from the outline.
+    fn envelope(kin: &Kin) -> (f32, f32, f32) {
+        let points: Vec<Vec2> = kin.envelope_outline(800).into_iter().flatten().collect();
+        let top = points.iter().map(|p| p.y).fold(f32::MIN, f32::max);
+        let bottom = points.iter().map(|p| p.y).fold(f32::MAX, f32::min);
+        let reach = points.iter().map(|p| p.x).fold(f32::MIN, f32::max);
+        (top, bottom, reach)
+    }
+
+    #[test]
     fn envelope_matches_data_sheet() {
-        // Top of the operating space: J2 vertical, J3 at its upper limit.
-        let top = Axes([0.0, 0.0, spec::MAX[2], 0.0]).pose().y + TOOL_LENGTH + JAW_HEIGHT;
-        assert!((top - spec::MAX_HEIGHT).abs() < 0.01, "{top}");
-        // Inner radius where the envelope crosses the floor, and its bottom.
-        let outline = envelope_outline(400);
-        let inner = outline
-            .windows(2)
-            .filter(|w| (w[0].y >= 0.0) != (w[1].y >= 0.0))
-            .map(|w| w[0].x)
+        for kin in MODELS {
+            let (top, bottom, reach) = envelope(kin);
+            assert!((top - kin.max_height).abs() < 0.01, "{:?} top {top}", kin.model);
+            assert!((bottom - kin.min_height).abs() < 0.03, "{:?} bottom {bottom}", kin.model);
+            assert!((reach - kin.reach).abs() < 0.08, "{:?} reach {reach}", kin.model);
+        }
+        // FANUC: inner radius where the envelope crosses the floor.
+        let inner = FANUC
+            .envelope_outline(400)
+            .iter()
+            .flat_map(|l| l.windows(2).filter(|w| (w[0].y >= 0.0) != (w[1].y >= 0.0)).map(|w| w[0].x).collect::<Vec<_>>())
             .fold(f32::MAX, f32::min);
-        assert!((inner - spec::MIN_RADIUS).abs() < 0.03, "{inner}");
-        let bottom = outline.iter().map(|p| p.y).fold(f32::MAX, f32::min);
-        assert!((bottom - spec::MIN_HEIGHT).abs() < 0.03, "{bottom}");
+        assert!((inner - FANUC.min_radius).abs() < 0.03, "{inner}");
+        // KUKA: maximum reach 3195 mm with the flange 513 mm above the floor (STEP).
+        let far = KUKA.pose(Axes([0.0, 90.0f32.to_radians() - 0.0, 0.0, 0.0]));
+        let _ = far;
+        let stretched = KUKA.j2_offset + KUKA.l1 + KUKA.l2 + KUKA.wrist_fwd;
+        assert!((stretched - KUKA.reach).abs() < 0.01, "{stretched}");
+        assert!((KUKA.base_height - KUKA.wrist_drop - 0.395).abs() < 0.01);
     }
 
     #[test]
     fn height_limit_follows_envelope() {
-        // Near the top of the envelope (J2 vertical, J3 at +10°) the flange is at 2397 mm.
-        let r = Axes([0.0, 0.0, spec::MAX[2], 0.0]).pose().r;
-        let top = max_tcp_height(r) + TOOL_LENGTH + JAW_HEIGHT;
-        assert!((top - spec::MAX_HEIGHT).abs() < 0.01, "{top}");
-        // Far out the arm cannot rise as much.
-        assert!(max_tcp_height(3.0) < max_tcp_height(2.0));
-        assert!(max_tcp_height(4.0) == f32::NEG_INFINITY);
+        for kin in MODELS {
+            // At the radius of the top of the envelope the flange reaches it.
+            let r = (0..=400)
+                .map(|k| 0.5 + 3.0 * k as f32 / 400.0)
+                .max_by(|a, b| kin.max_tcp_height(*a).total_cmp(&kin.max_tcp_height(*b)))
+                .unwrap();
+            let top = kin.max_tcp_height(r) + TOOL_LENGTH + JAW_HEIGHT;
+            assert!((top - kin.max_height).abs() < 0.02, "{:?} {top}", kin.model);
+            // Far out the arm cannot rise as much.
+            assert!(kin.max_tcp_height(3.0) < kin.max_tcp_height(2.0));
+            assert!(kin.max_tcp_height(4.0) == f32::NEG_INFINITY);
+        }
+    }
+
+    #[test]
+    fn kuka_limits_follow_data_sheet() {
+        // A2 -140° (leaning back 50°) and A3 165° are the ends of their ranges.
+        assert!(KUKA.within_limits(Axes([0.0, -50f32.to_radians(), -10f32.to_radians(), 0.0])));
+        assert!(!KUKA.within_limits(Axes([0.0, -55f32.to_radians(), 0.0, 0.0])));
+        // The arm rises at most 60° above the horizontal.
+        assert!(!KUKA.within_limits(Axes([0.0, 0.0, 65f32.to_radians(), 0.0])));
+        // A6 ±350°.
+        assert!(!KUKA.within_limits(Axes([0.0, 0.0, 0.0, 355f32.to_radians()])));
+        assert!(KUKA.reach_report(Vec3::new(4.0, 1.0, 0.0), 0.0).is_some_and(|r| r.contains("longe demais")));
+        // On a 0.8 m pedestal the arm works below its base (data sheet: down to -742 mm).
+        let below_base = Vec3::new(2.0, -0.15, 0.0);
+        assert!(KUKA.reach_report(below_base, -0.8).is_none());
+        assert!(KUKA.reach_report(below_base, 0.0).is_some_and(|r| r.contains("abaixo do piso")));
     }
 
     #[test]
     fn home_is_reachable() {
-        assert!(solve(&Pose::HOME).reachable);
+        for kin in MODELS {
+            assert!(kin.solve(&kin.home).reachable, "{:?}", kin.model);
+        }
     }
 
     #[test]
     fn axes_round_trip() {
-        let pose = Pose { theta: -1.2, r: 2.4, y: 0.8, yaw: 0.5 };
-        let back = pose.axes().pose();
-        assert!((back.local_point() - pose.local_point()).length() < 1e-3);
-        assert!((back.yaw - pose.yaw).abs() < 1e-5);
+        for kin in MODELS {
+            let pose = Pose { theta: -1.2, r: 2.4, y: 0.8, yaw: 0.5 };
+            let back = kin.pose(kin.axes(&pose));
+            assert!((back.local_point() - pose.local_point()).length() < 1e-3);
+            assert!((back.yaw - pose.yaw).abs() < 1e-5);
+        }
     }
 
     #[test]

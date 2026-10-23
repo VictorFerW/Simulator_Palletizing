@@ -699,13 +699,14 @@ fn pick_labels(p: &Pattern) -> Vec<String> {
     labels
 }
 
-/// The window. `tdps` are the palletizing TDP names; returns the pattern to apply
+/// The window. `tdps` are the palletizing TDPs (name, pallet base height, top of the
+/// operating space of the robots that reach it); returns the pattern to apply
 /// to `target` when the user clicks "Aplicar".
 /// `sized`: emitters and mesas (name, kind label, current box size in m).
 pub fn pattern_window(
     ctx: &egui::Context,
     state: &mut PatternUi,
-    tdps: &[(String, f32)],
+    tdps: &[(String, f32, f32)],
     mesa_box: Option<[f32; 3]>,
     sized: &[(String, &str, [f32; 3])],
 ) -> Option<(String, Pattern)> {
@@ -891,7 +892,7 @@ pub fn pattern_window(
                 egui::ComboBox::from_id_salt("pattern_target")
                     .selected_text(if state.target.is_empty() { "(escolha o TDP)" } else { &state.target })
                     .show_ui(ui, |ui| {
-                        for (name, _) in tdps {
+                        for (name, ..) in tdps {
                             ui.selectable_value(&mut state.target, name.clone(), name);
                         }
                     });
@@ -903,11 +904,11 @@ pub fn pattern_window(
                 }
             });
             // Top of the finished pallet on the chosen TDP, against the robot reach.
-            if let (Some((_, tdp_h)), Some(c)) = (tdps.iter().find(|(n, _)| *n == state.target), state.candidates.get(state.selected)) {
+            if let (Some((_, tdp_h, robot_top)), Some(c)) = (tdps.iter().find(|(n, ..)| *n == state.target), state.candidates.get(state.selected)) {
                 let top = tdp_h + c.height / 1000.0;
                 // The TCP is at the bottom of the fardos (clamp tips): the top of the
                 // last layer is one product higher.
-                let reach = crate::robot::spec::MAX_HEIGHT - crate::robot::TOOL_LENGTH - crate::robot::JAW_HEIGHT + c.pattern.unit[1];
+                let reach = robot_top - crate::robot::TOOL_LENGTH - crate::robot::JAW_HEIGHT + c.pattern.unit[1];
                 let text = format!("No {}, o topo do pallet completo fica a {:.2} m do piso.", state.target, top);
                 if top > reach {
                     ui.colored_label(

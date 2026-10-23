@@ -8,7 +8,7 @@ use std::f32::consts::FRAC_PI_2;
 use bevy::prelude::*;
 
 use crate::conveyor;
-use crate::model::{Equipment, EquipmentKind};
+use crate::model::{Equipment, EquipmentKind, RobotModel};
 use crate::robot::{self, RobotPart};
 
 #[derive(Resource)]
@@ -28,14 +28,13 @@ pub struct Palette {
     pub cardboard: Handle<StandardMaterial>,
     pub tape: Handle<StandardMaterial>,
     pub floor: Handle<StandardMaterial>,
-    /// Manufacturer model of the FANUC M-410iC/185, when its GLBs are in `assets/`.
-    pub robot_cad: Option<Vec<RobotCadPart>>,
+    pub kuka_orange: Handle<StandardMaterial>,
+    /// Manufacturer models of the robots whose GLBs are in `assets/`.
+    pub robot_cad: Vec<(RobotModel, Vec<RobotCadPart>)>,
 }
 
 /// One part of the manufacturer's robot model: which link it follows, mesh, material.
 pub type RobotCadPart = (robot::CadPart, Handle<Mesh>, Handle<StandardMaterial>);
-
-const ROBOT_CAD_DIR: &str = "models/fanuc_m410ic185";
 
 /// Same lookup as Bevy's file asset reader: BEVY_ASSET_ROOT, CARGO_MANIFEST_DIR or the exe folder.
 fn asset_root() -> std::path::PathBuf {
@@ -59,6 +58,7 @@ impl FromWorld for Palette {
             })
         };
         let fanuc_yellow = solid(0.98, 0.78, 0.02, 0.1, 0.45);
+        let kuka_orange = solid(1.0, 0.40, 0.0, 0.1, 0.45);
         let dark = solid(0.10, 0.11, 0.12, 0.2, 0.6);
         let steel = solid(0.62, 0.64, 0.67, 0.8, 0.35);
         let frame_blue = solid(0.12, 0.33, 0.60, 0.3, 0.5);
@@ -81,30 +81,29 @@ impl FromWorld for Palette {
             alpha_mode: AlphaMode::Blend,
             ..default()
         });
-        let cad_files_present = robot::CadPart::ALL
-            .iter()
-            .all(|(_, file)| asset_root().join(ROBOT_CAD_DIR).join(format!("{file}.glb")).exists());
-        let part_materials: Vec<Handle<StandardMaterial>> = robot::CadPart::ALL
-            .iter()
-            .map(|(part, file)| match (part, *file) {
-                (robot::CadPart::LevelRod | robot::CadPart::LevelLink | robot::CadPart::LeverRod, _) => steel.clone(),
-                (robot::CadPart::Flange, _) => dark.clone(),
-                _ => fanuc_yellow.clone(),
-            })
-            .collect();
-        let robot_cad = cad_files_present.then(|| {
+        let mut robot_cad = Vec::new();
+        for model in RobotModel::ALL {
+            let (parts, dir) = robot::CadPart::of(model);
+            if !parts.iter().all(|(_, file)| asset_root().join(dir).join(format!("{file}.glb")).exists()) {
+                continue;
+            }
             let assets = world.resource::<AssetServer>();
-            robot::CadPart::ALL
+            let list = parts
                 .iter()
-                .zip(part_materials)
-                .map(|((part, file), material)| {
-                    let mesh = assets.load(
-                        GltfAssetLabel::Primitive { mesh: 0, primitive: 0 }.from_asset(format!("{ROBOT_CAD_DIR}/{file}.glb")),
-                    );
+                .map(|(part, file)| {
+                    use robot::CadPart as P;
+                    let material = match part {
+                        P::LevelRod | P::LevelLink | P::LeverRod | P::KukaFlange => steel.clone(),
+                        P::Flange | P::KukaBase => dark.clone(),
+                        P::KukaColumn | P::KukaLinkArm | P::KukaArm | P::KukaWrist => kuka_orange.clone(),
+                        _ => fanuc_yellow.clone(),
+                    };
+                    let mesh = assets.load(GltfAssetLabel::Primitive { mesh: 0, primitive: 0 }.from_asset(format!("{dir}/{file}.glb")));
                     (*part, mesh, material)
                 })
-                .collect()
-        });
+                .collect();
+            robot_cad.push((model, list));
+        }
         Self {
             fanuc_yellow,
             dark,
@@ -121,6 +120,7 @@ impl FromWorld for Palette {
             cardboard,
             tape,
             floor,
+            kuka_orange,
             robot_cad,
         }
     }
@@ -218,7 +218,7 @@ pub fn build_visual(
                 }
             }
         }
-        EquipmentKind::Robot => robot_visual(parent, meshes, palette),
+        EquipmentKind::Robot => robot_visual(parent, meshes, palette, p.robot_model),
         EquipmentKind::CardboardPlacer => paper_visual(parent, meshes, palette, &p),
         EquipmentKind::PalletElevator => elevator_visual(parent, meshes, palette, &p),
         EquipmentKind::ShuttleCar => {
@@ -481,6 +481,15 @@ fn table_visual(parent: &mut ChildSpawnerCommands, meshes: &mut Assets<Mesh>, pa
             Transform::from_xyz((pusher.x0 + pusher.x1) / 2.0, h + 0.12, pusher.face_start + 0.02),
             ActuatorPlate { index },
         ));
+        if pusher.train {
+            // Physical guide on the far side: the row is pushed against it.
+            let dir = (pusher.face_end - pusher.face_start).signum();
+            parent.spawn((
+                Mesh3d(meshes.add(Cuboid::new(pusher.x1 - pusher.x0 + 0.3, 0.14, 0.02))),
+                MeshMaterial3d(palette.frame_grey.clone()),
+                Transform::from_xyz((pusher.x0 + pusher.x1) / 2.0, h + 0.09, dir * (w / 2.0 + 0.005)),
+            ));
+        }
         // Cylinder body outside the frame.
         parent.spawn((
             Mesh3d(meshes.add(Cylinder::new(0.04, 0.5))),
@@ -889,14 +898,24 @@ pub fn pallet_mesh(parent: &mut ChildSpawnerCommands, meshes: &mut Assets<Mesh>,
     }
 }
 
-fn robot_visual(parent: &mut ChildSpawnerCommands, meshes: &mut Assets<Mesh>, palette: &Palette) {
-    if let Some(parts) = &palette.robot_cad {
+fn robot_visual(parent: &mut ChildSpawnerCommands, meshes: &mut Assets<Mesh>, palette: &Palette, model: RobotModel) {
+    // Pedestal under a robot mounted above the floor (sized by robot::animate_robots).
+    parent.spawn((
+        Mesh3d(meshes.add(Cuboid::new(1.0, 1.0, 1.0))),
+        MeshMaterial3d(palette.frame_grey.clone()),
+        Transform::from_scale(Vec3::ZERO),
+        RobotPart::Pedestal,
+    ));
+    if let Some((_, parts)) = palette.robot_cad.iter().find(|(m, _)| *m == model) {
         for (part, mesh, material) in parts {
             parent.spawn((Mesh3d(mesh.clone()), MeshMaterial3d(material.clone()), Transform::default(), *part));
         }
         robot_gripper(parent, meshes, palette);
         return;
     }
+    // Parametric model.
+    let kin = robot::kin(model);
+    let paint = if model == RobotModel::KukaKr180R3200_2Pa { palette.kuka_orange.clone() } else { palette.fanuc_yellow.clone() };
     // Fixed base (J1 housing).
     parent.spawn((
         Mesh3d(meshes.add(Cuboid::new(1.05, 0.12, 1.05))),
@@ -905,7 +924,7 @@ fn robot_visual(parent: &mut ChildSpawnerCommands, meshes: &mut Assets<Mesh>, pa
     ));
     parent.spawn((
         Mesh3d(meshes.add(Cylinder::new(0.48, 0.22))),
-        MeshMaterial3d(palette.fanuc_yellow.clone()),
+        MeshMaterial3d(paint.clone()),
         Transform::from_xyz(0.0, 0.23, 0.0),
     ));
     // J1 turntable carrying the J2 housing; transform set by robot::animate.
@@ -914,19 +933,19 @@ fn robot_visual(parent: &mut ChildSpawnerCommands, meshes: &mut Assets<Mesh>, pa
         .with_children(|turntable| {
             turntable.spawn((
                 Mesh3d(meshes.add(Cylinder::new(0.44, 0.16))),
-                MeshMaterial3d(palette.fanuc_yellow.clone()),
+                MeshMaterial3d(paint.clone()),
                 Transform::from_xyz(0.0, 0.42, 0.0),
             ));
             turntable.spawn((
                 Mesh3d(meshes.add(Cuboid::new(0.55, 0.42, 0.62))),
-                MeshMaterial3d(palette.fanuc_yellow.clone()),
-                Transform::from_xyz(robot::J2_OFFSET * 0.6, robot::BASE_HEIGHT - 0.08, 0.0),
+                MeshMaterial3d(paint.clone()),
+                Transform::from_xyz(kin.j2_offset * 0.6, kin.base_height - 0.08, 0.0),
             ));
             for side in [-1.0, 1.0] {
                 turntable.spawn((
                     Mesh3d(meshes.add(Cylinder::new(0.2, 0.08))),
                     MeshMaterial3d(palette.dark.clone()),
-                    Transform::from_xyz(robot::J2_OFFSET, robot::BASE_HEIGHT, side * 0.35)
+                    Transform::from_xyz(kin.j2_offset, kin.base_height, side * 0.35)
                         .with_rotation(Quat::from_rotation_x(FRAC_PI_2)),
                 ));
             }
@@ -940,8 +959,8 @@ fn robot_visual(parent: &mut ChildSpawnerCommands, meshes: &mut Assets<Mesh>, pa
         .spawn((Transform::default(), Visibility::default(), RobotPart::LowerArm))
         .with_children(|arm| {
             arm.spawn((
-                Mesh3d(meshes.add(Cuboid::new(0.30, robot::L1 + 0.1, 0.26))),
-                MeshMaterial3d(palette.fanuc_yellow.clone()),
+                Mesh3d(meshes.add(Cuboid::new(0.30, kin.l1 + 0.1, 0.26))),
+                MeshMaterial3d(paint.clone()),
                 Transform::default(),
             ));
         });
@@ -949,14 +968,14 @@ fn robot_visual(parent: &mut ChildSpawnerCommands, meshes: &mut Assets<Mesh>, pa
         .spawn((Transform::default(), Visibility::default(), RobotPart::UpperArm))
         .with_children(|arm| {
             arm.spawn((
-                Mesh3d(meshes.add(Cuboid::new(0.22, robot::L2 + robot::UPPER_BACK, 0.22))),
-                MeshMaterial3d(palette.fanuc_yellow.clone()),
+                Mesh3d(meshes.add(Cuboid::new(0.22, kin.l2 + kin.upper_back, 0.22))),
+                MeshMaterial3d(paint.clone()),
                 Transform::default(),
             ));
             arm.spawn((
                 Mesh3d(meshes.add(Cylinder::new(0.16, 0.32))),
                 MeshMaterial3d(palette.dark.clone()),
-                Transform::from_xyz(0.0, -(robot::L2 + robot::UPPER_BACK) / 2.0 + 0.12, 0.0)
+                Transform::from_xyz(0.0, -(kin.l2 + kin.upper_back) / 2.0 + 0.12, 0.0)
                     .with_rotation(Quat::from_rotation_x(FRAC_PI_2)),
             ));
         });
@@ -964,7 +983,7 @@ fn robot_visual(parent: &mut ChildSpawnerCommands, meshes: &mut Assets<Mesh>, pa
         .spawn((Transform::default(), Visibility::default(), RobotPart::Rod))
         .with_children(|rod| {
             rod.spawn((
-                Mesh3d(meshes.add(Cuboid::new(0.07, robot::L1, 0.07))),
+                Mesh3d(meshes.add(Cuboid::new(0.07, kin.l1, 0.07))),
                 MeshMaterial3d(palette.steel.clone()),
                 Transform::default(),
             ));
@@ -973,9 +992,9 @@ fn robot_visual(parent: &mut ChildSpawnerCommands, meshes: &mut Assets<Mesh>, pa
         .spawn((Transform::default(), Visibility::default(), RobotPart::Wrist))
         .with_children(|wrist| {
             wrist.spawn((
-                Mesh3d(meshes.add(Cuboid::new(0.24, robot::WRIST_DROP, 0.24))),
-                MeshMaterial3d(palette.fanuc_yellow.clone()),
-                Transform::from_xyz(0.0, -robot::WRIST_DROP / 2.0, 0.0),
+                Mesh3d(meshes.add(Cuboid::new(0.24, kin.wrist_drop, 0.24))),
+                MeshMaterial3d(paint.clone()),
+                Transform::from_xyz(0.0, -kin.wrist_drop / 2.0, 0.0),
             ));
         });
     robot_gripper(parent, meshes, palette);

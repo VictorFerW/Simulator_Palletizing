@@ -173,11 +173,20 @@ pub fn paper_mechanics(
             (false, true) => Some(0.0),
             _ => None,
         };
+        let bottom = |ext: f32| HEAD_RETRACTED_Y - ext - held_t;
         if let Some(t) = target {
             let s = CYLINDER_SPEED * dt;
+            let before = state.compression;
             state.extension += (t - state.extension).clamp(-s, s);
+            // The head stops for a frame where it just touches (both sheet sensors off,
+            // as the FB expects in step 106), however long the frame (speed x4, low FPS).
+            if let Some(top) = surface
+                && before < 0.003
+                && bottom(state.extension) < top - 0.003
+            {
+                state.extension = state.extension.min(HEAD_RETRACTED_Y - held_t - (top - 0.004));
+            }
         }
-        let bottom = |ext: f32| HEAD_RETRACTED_Y - ext - held_t;
         if let Some(top) = surface
             && bottom(state.extension) < top - HEAD_FLOAT
         {

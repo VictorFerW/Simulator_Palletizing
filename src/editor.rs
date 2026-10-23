@@ -11,7 +11,7 @@ use bevy::{
 };
 
 use crate::model::{Equipment, EquipmentKind, Io, NeedsRebuild, Params, Selection, TagBindings, unique_name};
-use crate::robot::{REACH, RobotState, spec};
+use crate::robot::RobotState;
 use crate::mesa_logic::MesaLogic;
 use crate::sim::{self, ConveyorState, EmitterState, Load, MesaMech, PalletizerState};
 use crate::conveyor;
@@ -56,6 +56,8 @@ impl Default for EditorSettings {
 #[derive(Resource, Default)]
 pub struct EditRequests {
     pub add: Vec<EquipmentKind>,
+    /// New robots of these models.
+    pub add_robot: Vec<crate::model::RobotModel>,
     pub delete: Vec<Entity>,
     pub duplicate: Vec<Entity>,
     pub focus: Option<Entity>,
@@ -98,7 +100,7 @@ pub fn spawn_equipment(
             root.insert(ConveyorState::default());
         }
         EquipmentKind::Robot => {
-            root.insert(RobotState::default());
+            root.insert(RobotState::new(crate::robot::kin(equipment.params.robot_model)));
         }
         EquipmentKind::BoxEmitter | EquipmentKind::PalletDispenser => {
             root.insert(EmitterState::default());
@@ -137,15 +139,22 @@ pub fn process_edit_requests(
     let names: Vec<String> = equipment.iter().map(|(_, e, ..)| e.name.clone()).collect();
     let mut taken = names.clone();
     let target = cameras.single().map(|c| c.target).unwrap_or(Vec3::ZERO);
-    for kind in std::mem::take(&mut requests.add) {
-        let name = unique_name(kind.prefix(), taken.iter().map(String::as_str));
+    let robots_to_add: Vec<(EquipmentKind, Option<crate::model::RobotModel>)> =
+        std::mem::take(&mut requests.add_robot).into_iter().map(|m| (EquipmentKind::Robot, Some(m))).collect();
+    for (kind, model) in std::mem::take(&mut requests.add).into_iter().map(|k| (k, None)).chain(robots_to_add) {
+        let mut params = Params::for_kind(kind);
+        if let Some(model) = model {
+            params.robot_model = model;
+        }
+        let prefix = model.map_or(kind.prefix(), |m| m.prefix());
+        let name = unique_name(prefix, taken.iter().map(String::as_str));
         taken.push(name.clone());
         let at = Vec3::new((target.x / 0.5).round() * 0.5, 0.0, (target.z / 0.5).round() * 0.5);
         let entity = spawn_equipment(
             &mut commands,
             &mut meshes,
             &palette,
-            Equipment { name, kind, params: Params::for_kind(kind) },
+            Equipment { name, kind, params },
             Transform::from_translation(at),
             TagBindings::default(),
         );
@@ -405,6 +414,10 @@ pub fn pick_and_drag(
     }
 
     if mouse.pressed(MouseButton::Left) {
+        if keyboard.pressed(KeyCode::KeyV) {
+            // V + drag changes the height (keyboard_edit), not the position on the floor.
+            return;
+        }
         if let (Some((start, _)), Some(c)) = (drag.band, cursor) {
             drag.band = Some((start, c));
             return;
@@ -432,6 +445,7 @@ pub fn pick_and_drag(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn keyboard_edit(
     keyboard: Res<ButtonInput<KeyCode>>,
     focus: Res<UiFocus>,
@@ -439,9 +453,37 @@ pub fn keyboard_edit(
     mut selection: ResMut<Selection>,
     mut requests: ResMut<EditRequests>,
     mut equipment: Query<&mut Transform, With<Equipment>>,
+    mut motion: MessageReader<MouseMotion>,
+    mut height_drag: Local<f32>,
 ) {
+    let mouse_dy: f32 = motion.read().map(|m| m.delta.y).sum();
     if focus.keyboard_ui || selection.1.is_empty() {
+        *height_drag = 0.0;
         return;
+    }
+    // V held: moving the mouse up/down raises/lowers the selection (grid steps with snap).
+    if keyboard.pressed(KeyCode::KeyV) {
+        *height_drag -= mouse_dy * 0.004;
+        let snap = settings.snap != keyboard.pressed(KeyCode::AltLeft) && settings.grid > 0.0;
+        let dy = if snap {
+            let steps = (*height_drag / settings.grid).trunc();
+            steps * settings.grid
+        } else {
+            *height_drag
+        };
+        if dy != 0.0 {
+            *height_drag -= dy;
+            for e in &selection.1 {
+                if let Ok(mut tf) = equipment.get_mut(*e) {
+                    tf.translation.y = (tf.translation.y + dy).max(0.0);
+                    if snap {
+                        tf.translation.y = (tf.translation.y / settings.grid).round() * settings.grid;
+                    }
+                }
+            }
+        }
+    } else {
+        *height_drag = 0.0;
     }
     let shift = keyboard.pressed(KeyCode::ShiftLeft) || keyboard.pressed(KeyCode::ShiftRight);
     let ctrl = keyboard.pressed(KeyCode::ControlLeft) || keyboard.pressed(KeyCode::ControlRight);
@@ -628,18 +670,21 @@ pub fn draw_gizmos(
                 gizmos.circle(Isometry3d::new(at, Quat::from_rotation_x(FRAC_PI_2)), 0.15, Color::srgb(1.0, 1.0, 0.2));
             }
             EquipmentKind::Robot if selected => {
-                // Data sheet envelope: reach (R3143), inner radius at the floor (1100) and
-                // rear interference (R725), plus the operating space of the flange center
-                // in the current arm plane (top 2397, bottom -561).
+                // Data sheet envelope of the model: reach, inner radius at the floor and
+                // rear interference, plus the operating space of the flange center in the
+                // current arm plane.
+                let kin = crate::robot::kin(eq.params.robot_model);
                 let floor = Isometry3d::new(tf.translation + Vec3::Y * 0.01, Quat::from_rotation_x(FRAC_PI_2));
-                gizmos.circle(floor, REACH, Color::srgba(1.0, 0.8, 0.0, 0.6));
-                gizmos.circle(floor, spec::MIN_RADIUS, Color::srgba(1.0, 0.5, 0.0, 0.5));
-                gizmos.circle(floor, spec::REAR_RADIUS, Color::srgba(1.0, 0.2, 0.1, 0.6));
+                gizmos.circle(floor, kin.reach, Color::srgba(1.0, 0.8, 0.0, 0.6));
+                gizmos.circle(floor, kin.min_radius, Color::srgba(1.0, 0.5, 0.0, 0.5));
+                gizmos.circle(floor, kin.rear_radius, Color::srgba(1.0, 0.2, 0.1, 0.6));
                 let theta = robots.get(entity).map_or(0.0, |r| r.pose.theta);
-                let points = crate::robot::envelope_outline(24)
-                    .into_iter()
-                    .map(|p| tf.transform_point(Vec3::new(p.x * theta.cos(), p.y, -p.x * theta.sin())));
-                gizmos.linestrip(points, Color::srgba(0.3, 0.9, 1.0, 0.8));
+                for line in kin.envelope_outline(24) {
+                    let points = line
+                        .into_iter()
+                        .map(|p| tf.transform_point(Vec3::new(p.x * theta.cos(), p.y, -p.x * theta.sin())));
+                    gizmos.linestrip(points, Color::srgba(0.3, 0.9, 1.0, 0.8));
+                }
             }
             _ => {}
         }

@@ -38,7 +38,7 @@ As caixas colocadas pelo robô passam a fazer parte do pallet e andam junto com 
 
 | Ação | Como fazer |
 |---|---|
-| Adicionar | Painel **Catálogo**: esteira, Mesa 2 estágios, Mesa pré-forma 3 estágios, TDP, TDP de paletização, robô FANUC M-410iC/185, emissor, magazine de pallets, removedor, sensor fotoelétrico |
+| Adicionar | Painel **Catálogo**: esteira, Mesa 2 estágios, Mesa pré-forma 3 estágios, TDP, TDP de paletização, robô FANUC M-410iC/185 ou KUKA KR 180 R3200-2 PA, emissor, magazine de pallets, removedor, sensor fotoelétrico |
 | Selecionar | Clique no objeto ou na lista **Cena** |
 | Seleção múltipla | `Ctrl`+clique soma ou tira itens; arrastar com o botão esquerdo num espaço vazio desenha um retângulo de seleção (`Ctrl` para somar à seleção atual) |
 | Mover | Arraste qualquer item selecionado: o grupo inteiro se move (grade de 0,1 m; segure `Alt` para ignorar a grade). Setas: 0,1 m (`Shift`: 0,5 m). `PgUp`/`PgDn`: altura |
@@ -47,11 +47,32 @@ As caixas colocadas pelo robô passam a fazer parte do pallet e andam junto com 
 | Duplicar | `Ctrl+D` (todos os selecionados) |
 | Câmera | Botão direito: orbitar · botão do meio ou `Shift`+direito: deslocar · roda: zoom · `F`: focar no selecionado |
 
-Em **Propriedades** você ajusta comprimento, largura, altura e velocidade dos transportadores; no robô, a mesa de coleta, o TDP de paletização e o override de velocidade; no TDP de paletização, o número de camadas, o intertravamento (camadas ímpares giradas 90°) e a lógica interna; no emissor, o intervalo e o tamanho da caixa.
+Com itens selecionados, segure **V** e mova o mouse para cima ou para baixo para subir ou descer a seleção (em passos da grade quando ela está ligada; **Alt** desliga o encaixe).
 
-**Arquivo → Salvar/Abrir layout** grava a célula inteira em JSON: equipamentos, vínculos de tags, projeto TIA importado e configurações do CLP.
+Em **Propriedades** você ajusta comprimento, largura, altura e velocidade dos transportadores; no robô, a mesa de coleta, o TDP de paletização e o override de velocidade; no TDP de paletização, o número de camadas, o intertravamento (camadas ímpares giradas 90°) e a lógica interna; no emissor, o intervalo e o tamanho da caixa. Uma esteira que entra de lado em outra (como a Linha 1B na Linha 1) segura o fardo no fim até o trecho da outra ficar livre, e as guias laterais (largura da esteira) mantêm o fardo na faixa de entrada da mesa.
 
-## Robô FANUC M-410iC/185
+**Reiniciar** (barra de ferramentas) tira todas as caixas e pallets e volta cada equipamento ao primeiro passo do seu FB: robôs, mesas, elevadores, colocadores de papelão (CP) e carros (CVZ/CCH, que voltam ao início do trilho), mesmo no meio de um ciclo.
+
+### Projetos
+
+Ao abrir o simulador aparece a **tela inicial** com os projetos:
+
+- **Novo projeto (vazio)** ou **Novo com a célula padrão**: dê um nome; o projeto já é criado e salvo na pasta de projetos.
+- Cada projeto salvo aparece num cartão com a **prévia do layout vista de cima** (robô em laranja, mesas em azul, TDPs, carros CVZ/CCH em amarelo, emissores em verde, removedores em vermelho), o número de equipamentos e quando foi alterado. Clique na prévia ou em **Abrir** para abrir.
+- **Excluir** pede confirmação e apaga o arquivo. Para um arquivo de fora da pasta, também dá para só tirá-lo da lista.
+- **Abrir outro arquivo...** abre um layout salvo em outro lugar; ele passa a aparecer na lista como recente.
+
+A pasta é `Documentos\Simulador de Paletização\Projetos` (ou a definida em `PDT_PROJECTS`). No menu **Arquivo**: **Projetos (tela inicial)** volta a essa tela (com **Voltar ao projeto aberto**), **Salvar** (`Ctrl+S`) grava no arquivo do projeto aberto, **Salvar como...** escolhe outro arquivo, e **Abrir arquivo...** abre qualquer layout. O nome do projeto aberto aparece na barra de ferramentas.
+
+O arquivo do projeto (JSON) grava a célula inteira em JSON: equipamentos, vínculos de tags, projeto TIA importado e configurações do CLP.
+
+## Robôs: FANUC M-410iC/185 e KUKA KR 180 R3200-2 PA
+
+O robô pode ficar acima do piso: com **Altura (Y)** maior que zero, ele é desenhado sobre um pedestal, e o braço trabalha abaixo da própria base até o limite da folha de dados (FANUC −561 mm, KUKA −742 mm). O piso de verdade continua sendo o limite: o robô só reporta "abaixo do piso" para pontos abaixo do chão da célula. Com o robô a 0,8 m, por exemplo, o topo de um pallet num TDP de 0,5 m fica 0,15 m abaixo da base e é alcançado normalmente.
+
+Há dois modelos no catálogo: **Robô FANUC M-410iC/185** e **Robô KUKA KR 180 R3200-2 PA**. No painel do robô, **Modelo** troca o modelo de um robô já colocado (ele volta à posição de repouso do novo modelo). Cada modelo tem a sua cinemática, faixas, velocidades, envelope e modelo 3D do fabricante. O cabeçote, o programa de paletização, as rotas e o log de falhas são os mesmos.
+
+### FANUC M-410iC/185
 
 O modelo é paramétrico e reproduz a cinemática de paletizador de 4 eixos: J1 é a base, J2/J3 formam o braço com paralelogramo que mantém o flange horizontal e J4 gira o punho. O alcance é de aproximadamente 3,1 m, como na folha de dados. O programa interno faz o papel da rotina de paletização do controlador: espera a caixa no fim do transportador, coleta, sobe até a altura segura, gira, deposita na posição do padrão, sobe de novo e repete. Quando o pallet fica completo, sinaliza **Pallet completo**.
 
@@ -76,13 +97,50 @@ A divisão das faixas de J2 e J3, que a folha de dados dá só como total, foi e
 
 Os movimentos seguem as rotinas TP. As transferências são **J** (interpolação por eixos): a duração vem do eixo mais lento na sua velocidade máxima. As subidas e descidas são **L** (reta) nas velocidades das rotinas: PICK desce a 3000 mm/s e sobe a 1800 mm/s; PLACE desce a 2000 mm/s e sobe a 4000 mm/s, limitadas pelas velocidades dos eixos. Todos usam perfil trapezoidal com rampa de 0,35 s e são multiplicados pelo override (`OVERRIDE=R[104]`). O J1 não passa de ±180°: se a mesa e o pallet estiverem dos dois lados dessa emenda, o robô dá a volta longa, como o real. Por isso, gire a base do robô para que o 0° do J1 aponte para a área de trabalho (na célula padrão, −135°). O painel do robô mostra a posição e a velocidade de cada eixo contra os limites. Com o robô selecionado, o editor desenha o alcance, o raio interno, a interferência traseira e o contorno do espaço de trabalho no plano do braço.
 
-A altura de segurança das transferências (coleta/pallet + 0,35 m) e o perch são limitados pela altura máxima que o braço alcança naquele raio. Perto do topo do envelope essa altura cai: com o cabeçote (435 mm até o quadro mais 295 mm de pinça), a base dos fardos chega a ~1,65 m em 2,1 m de raio e ~1,18 m em 2,9 m. Se não houver folga para passar sobre a coleta ou o pallet, o robô para com "Altura máxima do robô" em vez de esticar o braço além dos limites.
+A altura de segurança das transferências e o perch são limitados pela altura máxima que o braço alcança naquele raio. Perto do topo do envelope essa altura cai: com o cabeçote (435 mm até o quadro mais 295 mm de pinça), a base dos fardos do FANUC chega a ~1,65 m em 2,1 m de raio e ~1,18 m em 2,9 m. Se não houver folga para passar sobre o pallet, o robô para com uma falha no log, em vez de esticar o braço além dos limites.
 
 A geometria do braço vem do modelo STEP do fabricante. Ele divide os mesmos 1945 mm um pouco diferente da folha de dados: 394/1306/244 mm contra 390/1300/255 mm.
+
+### KUKA KR 180 R3200-2 PA
+
+| Item | Valor (folha de dados 0000-361-137 V5.1) |
+| --- | --- |
+| Carga nominal / máxima | 180 kg / 230 kg |
+| Alcance máximo | 3195 mm |
+| Repetibilidade (ISO 9283) | ±0,07 mm |
+| Eixos | 5 (A4 não existe) |
+| Massa | ~1017 kg, base 754 × 754 mm, no piso |
+| Faixas de movimento | A1 ±185°, A2 −140° a −5°, A3 0° a 165°, A5 −55° a 150°, A6 ±350° |
+| Velocidades com carga nominal | A1 137°/s, A2 111°/s, A3 119°/s, A5 225°/s, A6 321°/s |
+
+As medidas vêm do esqueleto que está no próprio STEP do fabricante: A2 a 645 mm do piso e 330 mm à frente do A1, braço de ligação (A2–A3) de 1350 mm, braço (A3–A5) de 1255 mm, e flange 265 mm à frente e 250 mm abaixo do A5. No KUKA, A2 = −90° e A3 = +90° com o braço de ligação na vertical e o braço na horizontal: o A3 é o ângulo entre os dois braços (e não a partir da horizontal, como o J3 do FANUC). O A5 mantém o flange na horizontal. Com as faixas do A2 e do A3 e o braço subindo no máximo 60° acima da horizontal (gráfico do espaço de trabalho), o envelope do centro do flange fica igual ao do STEP: alcance de 3195 mm a 513 mm de altura, topo a 2832 mm e fundo a −742 mm (há testes para isso). O painel mostra A1, A2, A3 e A6 na convenção KUKA. As velocidades de cada movimento são verificadas nesses eixos, então um movimento que só gira o braço (A3) é limitado pelos 119°/s do A3.
+
+O modelo 3D (`assets/models/kuka_kr180_r3200_2_pa/*.glb`) foi separado do STEP em base fixa, coluna (A1), braço de ligação (A2), braço (A3), punho (A5) e flange (A6).
+
+O programa segue as rotinas KRL da célula (`RSR0001`, `MovePick`, `MovePlace`, `MovePerch`, `MoveHome`):
+
+- **MovePick:** sobe em SLIN a 3,0 m/s até a altura segura (no máximo Z 2000), vai em SPTP 100 % até acima da coleta e desce em SLIN (3,0 até o ponto de aproximação e 2,5 m/s até a pega). O simulador desce direto a 2,5 m/s.
+- **MovePlace:** sobe em SLIN a 3,0 m/s, vai em SPTP 100 % até acima do depósito e desce em SLIN (2,5 até a aproximação e 3,0 até o depósito). O simulador desce a 2,5 m/s. No segundo depósito da mesma pega (`RoboSegundoPlace`), sobe só o necessário para passar ao lado.
+- As transferências ficam abaixo de 2,0 m, a não ser que a camada exija mais. O status mostra a rotina em execução (por exemplo, "MovePick: indo para a coleta").
+
+Ainda não estão simulados: o desvio por X 1500 / Y ±1200 quando a coleta e o depósito ficam em lados opostos, a aproximação contínua (C_SPL, `$APO.CDIS`) e os dados de aproximação enviados pelo CLP (`DadosXAprox`, `DadosDesviaInfeed`…).
 
 ### Várias mesas, vários TDPs e vários robôs
 
 Em **Coletar de** e **Paletizar em** marque uma ou mais mesas/esteiras e um ou mais TDPs de paletização; sem nenhum marcado, o robô usa todos ao alcance. As mesas são atendidas em rodízio, e o TDP com o pallet mais adiantado vem primeiro, então os pallets são completados um de cada vez (quando um sai, o robô passa para o outro).
+
+Em **Rotas no alcance**, o robô lista sozinho os TDPs de paletização e as mesas que alcança. Para cada TDP, escolha de quais mesas ele recebe (por exemplo, TDP A recebe da Mesa B e TDP B recebe da Mesa A); sem escolha, o TDP recebe de todas. Se um grupo de fardos chega girado 90° em relação ao do pallet (por exemplo, vindo de uma esteira lateral), o robô o gira para casar com a posição.
+
+### Log de falhas
+
+Quando o robô não consegue chegar a uma posição, ele para com o status **Falha: posição fora do alcance** (em vermelho) e registra o motivo em **Log de falhas**, no painel do robô (as 20 mais recentes, a mais nova primeiro; a mesma falha só é registrada de novo depois que muda). Cada linha diz qual ponto falhou e por quê:
+
+- **Coleta em Mesa_X** ou **depósito no TDP_X (posição N do padrão)**: o raio e a altura do TCP e o motivo, por exemplo "longe demais: 3190 mm do eixo J2 até o punho, o braço estica até 2526 mm", "J3 precisaria de 14° (faixa −126° a 10°)", "abaixo do piso" ou "nesse raio o TCP sobe só até 1,39 m". Cada falha entra no log uma vez enquanto dura; se ela some e volta, entra de novo.
+- **Altura sobre o TDP_X**: os fardos carregados (o TCP fica na base deles) precisam passar 5 cm acima do topo da camada em montagem, e o braço não sobe tanto naquele raio. A mensagem dá a altura necessária, a altura máxima e o raio.
+
+Sobre o pallet, o robô passa a 15 cm acima da camada em montagem (nunca acima do que alcança naquele raio). Na coleta, que costuma ficar perto da base, ele sobe só até onde alcança ali. Com `PDT_TRACE=1`, as falhas também saem no terminal como `FALHA ...`.
+
+Na célula padrão, os TDPs de paletização usam 3 camadas de fardos de 250 mm: com 4, a 4ª camada dos TDPs 1 e 2 fica acima do que o M-410iC alcança a 2,06 m de raio, e o log mostra essa falha.
 
 Vários robôs podem dividir mesas e TDPs. Cada robô reserva a mesa do planejamento até levantar os fardos e o TDP até terminar a deposição; quem está esperando um equipamento ocupado é o próximo a usá-lo, então os robôs se revezam. A colisão entre os braços não é simulada.
 
@@ -136,7 +194,10 @@ Na mesa 3 estágios, a opção **Receita 10x1** (o `Fardo10Kg` do FB) troca a l�
 
 1. **Roletada:** entra um fardo. Se a pré-formadora pede um, ele segue direto. Se pede dois, a garra empurra a fileira, entra outro, a garra empurra de novo e os dois seguem.
 2. **Pré-formadora:** o primeiro fardo vai até o batente pelo empurrador; o cilindro alivia e chegam os dois da roletada, formando um grupo de 3.
-3. **Coleta:** conforme a pega do robô (`FardosPonto`), a pré-formadora manda os 3 para a coleta, ou recebe mais um fardo reto e manda 4.
+3. **Coleta:** com o grupo de 3 (como no FB), os 3 vão para a coleta.
+4. **Grupo de 4 (como na máquina):** a roletada acumula 3 (entra um, a garra empurra, entra outro, a garra empurra de novo, entra o terceiro) e manda os 3 juntos. O empurrador leva a fileira até a **guia física** da pré-formadora, o 4º fardo vem reto e os 4 vão para a coleta.
+
+O empurrador da receita 10x1 empurra a fileira inteira e para quando ela encosta na guia. O tamanho de cada grupo (`FardosPonto`) vem da sequência de pegas do padrão aplicado, que o robô passa para a mesa; a mesa a percorre grupo a grupo.
 
 Na tela de padrões, marque **receita 10x1** no cabeçote. As pegas passam a seguir o ciclo **4 → 3 → 3**: o robô pega os 4 e deposita 2 numa ponta e 2 na outra (abre um lado do cabeçote de cada vez), depois deposita os 3 de uma vez, e de novo 3. A tela põe primeiro os formatos que fecham esse ciclo, como 10 por camada em 2 fileiras de 5 com o fardo atravessado, e avisa quando um formato não fecha. O robô avisa a mesa quantos fardos a próxima pega precisa. Se chegar um número diferente, ele deposita os fardos um a um nas próximas posições.
 
@@ -165,6 +226,8 @@ O trilho fica ao longo do X local do equipamento e o TDP do carro transporta ao 
 
 Sem CLP, a **lógica interna** porta o posicionamento do FB CVZ (passo 201): velocidade nominal, redução proporcional a partir de 500 mm, velocidade de precisão nos últimos 50 mm, desliga o inversor na tolerância de 5 mm e trava o freio quando a velocidade real chega a zero. O ciclo interno é simples: recebe o pallet na coleta, leva às posições A, B… em sequência, descarrega e volta. A escolha do destino do FB real depende dos IDs de rastreamento dos pallets; com o CLP conectado, ela vem do CLP.
 
+
+O CVZ pode ter várias **coletas**: marque a caixa **Coleta** nas paradas onde ele recebe pallets vazios. O carro vai à coleta que tem pallet esperando no fim do TDP, e as coletas com pallet se revezam. O lado é tirado do layout: se o TDP que entrega está do outro lado do carro, o TDP do carro roda ao contrário até o pallet encostar no fim. Na descarga, ele roda para o lado onde está o TDP que recebe.
 ## Sinais
 
 | Equipamento | Entradas (CLP escreve) | Saídas (simulador escreve) |

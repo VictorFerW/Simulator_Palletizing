@@ -254,7 +254,7 @@ pub fn layout(eq: &Equipment) -> ConveyorLayout {
                         sensor_retracted: "SensorEmpurradorRec",
                         lift: None,
                         comb: false,
-                        train: false,
+                        train: true,
                     },
                 ],
                 pick_x0: Some(x_col),

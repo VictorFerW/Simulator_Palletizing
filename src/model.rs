@@ -349,6 +349,10 @@ pub struct Params {
     pub place_on: Vec<String>,
     /// Robot speed override 0.1..=1.0.
     pub speed_override: f32,
+    /// Robot: manufacturer model (kinematics, limits, speeds and 3D model).
+    pub robot_model: RobotModel,
+    /// Robot: which mesas feed each palletizing TDP (none listed = every one).
+    pub routes: Vec<Route>,
     /// CVZ: TDP on the car, length along its transport (across the rail).
     pub car_length: f32,
     /// CVZ: TDP on the car, width (along the rail).
@@ -365,6 +369,8 @@ pub struct Params {
     pub stops: Vec<f32>,
     /// CVZ: index of the stop under a colocador de papelão (-1: none).
     pub paper_stop: i32,
+    /// CVZ: stops where the car takes empty pallets (coleta); empty = the first stop.
+    pub pickup_stops: Vec<usize>,
     /// CP: vertical cylinder stroke (m).
     pub cp_stroke: f32,
     /// CP: lay cardboard on the pallets (else they are just released).
@@ -380,6 +386,47 @@ pub struct Params {
     pub pattern: Option<crate::pattern::Pattern>,
     /// Elevador: a new stack is set on the TDP when the last pallet leaves.
     pub auto_refill: bool,
+}
+
+/// Palletizing robot models.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum RobotModel {
+    #[default]
+    FanucM410iC185,
+    KukaKr180R3200_2Pa,
+}
+
+impl RobotModel {
+    pub const ALL: [Self; 2] = [Self::FanucM410iC185, Self::KukaKr180R3200_2Pa];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::FanucM410iC185 => "FANUC M-410iC/185",
+            Self::KukaKr180R3200_2Pa => "KUKA KR 180 R3200-2 PA",
+        }
+    }
+
+    /// Name prefix of new robots of this model.
+    pub fn prefix(self) -> &'static str {
+        match self {
+            Self::FanucM410iC185 => "FANUC_M410iC",
+            Self::KukaKr180R3200_2Pa => "KUKA_KR180",
+        }
+    }
+}
+
+/// Robot route: the mesas/belts whose products go to the TDP `tdp`.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct Route {
+    pub tdp: String,
+    pub from: Vec<String>,
+}
+
+impl Params {
+    /// Robot: the pick conveyor `pick` may feed the TDP `tdp`.
+    pub fn routed(&self, tdp: &str, pick: &str) -> bool {
+        self.routes.iter().find(|r| r.tdp == tdp).is_none_or(|r| r.from.is_empty() || r.from.iter().any(|n| n == pick))
+    }
 }
 
 /// A list of equipment names; older layouts stored a single name (empty = none).
@@ -413,6 +460,8 @@ impl Default for Params {
             pick_from: Vec::new(),
             place_on: Vec::new(),
             speed_override: 1.0,
+            robot_model: RobotModel::default(),
+            routes: Vec::new(),
             car_length: 1.56,
             car_width: 1.28,
             car_speed: 1.0,
@@ -421,6 +470,7 @@ impl Default for Params {
             giro_speed: 30.0,
             stops: vec![1.0, 4.0, 7.0],
             paper_stop: -1,
+            pickup_stops: Vec::new(),
             cp_stroke: 1.05,
             apply_paper: true,
             cp_two_sheets: false,
@@ -433,6 +483,11 @@ impl Default for Params {
 }
 
 impl Params {
+    /// CVZ: the stop `i` is a coleta.
+    pub fn is_pickup(&self, i: usize) -> bool {
+        if self.pickup_stops.is_empty() { i == 0 } else { self.pickup_stops.contains(&i) }
+    }
+
     pub fn for_kind(kind: EquipmentKind) -> Self {
         let base = Self::default();
         match kind {
@@ -628,4 +683,30 @@ pub fn unique_name<'a>(prefix: &str, existing: impl Iterator<Item = &'a str>) ->
         .map(|n| format!("{prefix}_{n}"))
         .find(|candidate| !taken.contains(&candidate.as_str()))
         .expect("infinite iterator")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn routes_pick_the_mesa_of_each_tdp() {
+        let mut p = Params::default();
+        assert!(p.routed("TDP_A", "Mesa_A"));
+        p.routes = vec![
+            Route { tdp: "TDP_A".into(), from: vec!["Mesa_B".into()] },
+            Route { tdp: "TDP_B".into(), from: vec!["Mesa_A".into()] },
+        ];
+        assert!(p.routed("TDP_A", "Mesa_B") && !p.routed("TDP_A", "Mesa_A"));
+        assert!(p.routed("TDP_B", "Mesa_A") && !p.routed("TDP_B", "Mesa_B"));
+        // A TDP with no route takes from every mesa.
+        assert!(p.routed("TDP_C", "Mesa_A"));
+    }
+
+    #[test]
+    fn old_single_name_routes_still_load() {
+        let p: Params = serde_json::from_str(r#"{"pick_from": "Mesa_1", "place_on": ""}"#).unwrap();
+        assert_eq!(p.pick_from, vec!["Mesa_1".to_owned()]);
+        assert!(p.place_on.is_empty() && p.routes.is_empty());
+    }
 }

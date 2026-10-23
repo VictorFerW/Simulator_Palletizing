@@ -9,6 +9,7 @@ mod mesa_logic;
 mod model;
 mod paper;
 mod pattern;
+mod projects;
 mod robot;
 mod s7;
 mod shuttle;
@@ -54,6 +55,7 @@ fn main() {
         .init_resource::<DragState>()
         .init_resource::<EditRequests>()
         .init_resource::<LayoutRequests>()
+        .init_resource::<projects::StartScreen>()
         .init_resource::<io::PlcLink>()
         .init_resource::<ui::UiState>()
         .add_systems(Startup, (setup_scene, layout::setup_default_cell))
@@ -118,8 +120,8 @@ fn main() {
 
 /// `PDT_SCREENSHOT=arquivo.png` saves a screenshot after `PDT_SCREENSHOT_SECS`
 /// (default 12 s) and exits; `PDT_SELECT=nome` selects that equipment first,
-/// `PDT_FOCUS` points the camera at it, `PDT_TIME_SCALE` speeds up the simulation
-/// and `PDT_LAYOUT` opens a layout.
+/// `PDT_FOCUS` points the camera at it, `PDT_TIME_SCALE` speeds up the simulation,
+/// `PDT_RESET_SECS` presses "Reiniciar" once at that time and `PDT_LAYOUT` opens a layout.
 /// Used for automated visual checks.
 #[allow(clippy::too_many_arguments)]
 fn auto_screenshot(
@@ -146,6 +148,13 @@ fn auto_screenshot(
                 requests.focus = selection.0;
             }
         }
+    if let Some(reset) = std::env::var("PDT_RESET_SECS").ok().and_then(|s| s.parse::<f32>().ok())
+        && *done == 0
+        && time.elapsed_secs() > reset
+        && time.elapsed_secs() - time.delta_secs() <= reset
+    {
+        control.reset_requested = true;
+    }
     let at: f32 = std::env::var("PDT_SCREENSHOT_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(12.0);
     let elapsed = time.elapsed_secs();
     if *done == 0 && elapsed > at {
