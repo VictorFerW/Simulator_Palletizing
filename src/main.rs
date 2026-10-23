@@ -1,3 +1,5 @@
+mod belt;
+mod catalog;
 mod communication;
 mod conveyor;
 mod editor;
@@ -14,8 +16,10 @@ mod robot;
 mod s7;
 mod shuttle;
 mod sim;
+mod thumbs;
 mod tia_importer;
 mod ui;
+mod ui_catalog;
 mod visuals;
 
 use bevy::prelude::*;
@@ -56,9 +60,10 @@ fn main() {
         .init_resource::<EditRequests>()
         .init_resource::<LayoutRequests>()
         .init_resource::<projects::StartScreen>()
+        .init_resource::<editor::UndoHistory>()
         .init_resource::<io::PlcLink>()
         .init_resource::<ui::UiState>()
-        .add_systems(Startup, (setup_scene, layout::setup_default_cell))
+        .add_systems(Startup, (setup_scene, layout::setup_default_cell, ui_catalog::load_thumbs))
         .add_systems(
             Update,
             (
@@ -69,7 +74,7 @@ fn main() {
                     editor::rebuild_visuals,
                 )
                     .chain(),
-                (editor::camera_controls, editor::pick_and_drag, editor::keyboard_edit),
+                (editor::camera_controls, editor::pick_and_drag, editor::keyboard_edit, editor::undo_redo),
                 (
                     // Controllers: PLC values or internal logic -> actuators.
                     (
@@ -78,6 +83,7 @@ fn main() {
                         sim::reset_simulation,
                         sim::palletizers,
                         mesa_logic::run_mesas,
+                        belt::run_belts,
                         shuttle::shuttle_logic,
                         fullcar::fullcar_logic,
                         paper::paper_logic,
@@ -114,14 +120,18 @@ fn main() {
                 .chain(),
         )
         .add_systems(EguiPrimaryContextPass, (ui::ui_system, ui::selection_band).chain())
+        .add_systems(Update, robot::mount_on_base.before(robot::robot_program))
         .add_systems(Update, auto_screenshot)
+        .add_systems(Update, thumbs::make_thumbnails)
         .run();
 }
 
 /// `PDT_SCREENSHOT=arquivo.png` saves a screenshot after `PDT_SCREENSHOT_SECS`
 /// (default 12 s) and exits; `PDT_SELECT=nome` selects that equipment first,
 /// `PDT_FOCUS` points the camera at it, `PDT_TIME_SCALE` speeds up the simulation,
-/// `PDT_RESET_SECS` presses "Reiniciar" once at that time and `PDT_LAYOUT` opens a layout.
+/// `PDT_RESET_SECS` presses "Reiniciar" once at that time, `PDT_CAMERA=yaw,pitch,raio`
+/// (degrees, meters) sets the camera after the focus, `PDT_UNDO_TEST` moves the
+/// selected equipment 1 m at 2 s and undoes it at 4 s, and `PDT_LAYOUT` opens a layout.
 /// Used for automated visual checks.
 #[allow(clippy::too_many_arguments)]
 fn auto_screenshot(
@@ -133,6 +143,8 @@ fn auto_screenshot(
     mut control: ResMut<SimControl>,
     mut requests: ResMut<EditRequests>,
     equipment: Query<(Entity, &model::Equipment)>,
+    mut cameras: Query<&mut editor::OrbitCamera>,
+    (mut history, mut transforms): (ResMut<editor::UndoHistory>, Query<&mut Transform, With<model::Equipment>>),
 ) {
     use bevy::render::view::screenshot::{Screenshot, save_to_disk};
     let Ok(path) = std::env::var("PDT_SCREENSHOT") else { return };
@@ -154,6 +166,51 @@ fn auto_screenshot(
         && time.elapsed_secs() - time.delta_secs() <= reset
     {
         control.reset_requested = true;
+    }
+    if let Ok(spec) = std::env::var("PDT_CAMERA")
+        && time.elapsed_secs() > 1.0
+        && let [yaw, pitch, radius] = spec.split(',').filter_map(|v| v.trim().parse::<f32>().ok()).collect::<Vec<_>>()[..]
+        && let Ok(mut camera) = cameras.single_mut()
+    {
+        camera.yaw = yaw.to_radians();
+        camera.pitch = pitch.to_radians();
+        camera.radius = radius;
+    }
+    // PDT_PLACE_TEST=x,y: drops the KUKA card at that screen point at 2 s.
+    if let Ok(spec) = std::env::var("PDT_PLACE_TEST")
+        && let [x, y] = spec.split(',').filter_map(|v| v.trim().parse::<f32>().ok()).collect::<Vec<_>>()[..]
+    {
+        let (now, before) = (time.elapsed_secs(), time.elapsed_secs() - time.delta_secs());
+        if now > 2.0 && before <= 2.0 {
+            requests.place.push((0, Some(Vec2::new(x, y))));
+        }
+        if now > 3.0 && before <= 3.0
+            && let Some(entity) = selection.0
+            && let Ok(tf) = transforms.get(entity)
+        {
+            eprintln!("teste arrastar: colocado em x {:.2} z {:.2}", tf.translation.x, tf.translation.z);
+        }
+    }
+    if std::env::var("PDT_UNDO_TEST").is_ok()
+        && let Some(entity) = selection.0
+        && let Ok(mut tf) = transforms.get_mut(entity)
+    {
+        let (now, before) = (time.elapsed_secs(), time.elapsed_secs() - time.delta_secs());
+        let crossed = |t: f32| now > t && before <= t;
+        if crossed(2.0) {
+            tf.translation.x += 1.0;
+            eprintln!("teste desfazer: movido para x {:.2}", tf.translation.x);
+        }
+        if crossed(4.0) {
+            history.request = Some(true);
+        }
+        if crossed(5.0) {
+            eprintln!("teste desfazer: depois do Ctrl+Z x {:.2}", tf.translation.x);
+            history.request = Some(false);
+        }
+        if crossed(6.0) {
+            eprintln!("teste desfazer: depois do Ctrl+Y x {:.2}", tf.translation.x);
+        }
     }
     let at: f32 = std::env::var("PDT_SCREENSHOT_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(12.0);
     let elapsed = time.elapsed_secs();
@@ -186,6 +243,11 @@ fn setup_scene(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>, palette
         },
         Transform::from_xyz(6.0, 12.0, 4.0).looking_at(Vec3::ZERO, Vec3::Y),
     ));
+    // Catalog pictures (PDT_THUMBS): plain background, no floor.
+    if thumbs::thumbs_enabled() {
+        commands.insert_resource(ClearColor(Color::srgb(0.17, 0.18, 0.20)));
+        return;
+    }
     commands.spawn((
         Mesh3d(meshes.add(Plane3d::default().mesh().size(40.0, 40.0))),
         MeshMaterial3d(palette.floor.clone()),

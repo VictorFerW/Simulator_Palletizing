@@ -26,6 +26,16 @@ pub fn projects_dir() -> PathBuf {
     dir
 }
 
+/// Absolute path without the `\\?\` prefix Windows adds when canonicalizing.
+fn canon(path: &Path) -> PathBuf {
+    let full = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let text = full.to_string_lossy();
+    match text.strip_prefix(r"\\?\") {
+        Some(rest) => PathBuf::from(rest),
+        None => full,
+    }
+}
+
 fn recent_file() -> PathBuf {
     projects_dir().join(".recentes.json")
 }
@@ -45,7 +55,7 @@ fn store_recent(list: &[PathBuf]) {
 
 /// A layout was opened or saved: first in the recent list.
 pub fn remember(path: &Path) {
-    let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let path = canon(path);
     let mut list = recent_list();
     list.retain(|p| *p != path);
     list.insert(0, path);
@@ -108,13 +118,13 @@ impl StartScreen {
 
     fn refresh(&mut self) {
         let dir = projects_dir();
-        let canonical_dir = std::fs::canonicalize(&dir).unwrap_or(dir.clone());
+        let canonical_dir = canon(&dir);
         let mut paths: Vec<PathBuf> = std::fs::read_dir(&dir)
             .map(|rd| {
                 rd.filter_map(|e| e.ok().map(|e| e.path()))
                     .filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("json")))
                     .filter(|p| !p.file_name().is_some_and(|n| n.to_string_lossy().starts_with('.')))
-                    .map(|p| std::fs::canonicalize(&p).unwrap_or(p))
+                    .map(|p| canon(&p))
                     .collect()
             })
             .unwrap_or_default();
@@ -309,7 +319,7 @@ pub fn start_screen(ctx: &egui::Context, start: &mut StartScreen, layout: &mut L
             start.message = if from_disk {
                 match std::fs::remove_file(&path) {
                     Ok(()) => {
-                        if layout.current.as_ref().is_some_and(|c| std::fs::canonicalize(c).ok().as_ref() == Some(&path)) {
+                        if layout.current.as_ref().is_some_and(|c| canon(c) == path) {
                             layout.current = None;
                         }
                         format!("\"{}\" excluído.", start.entries[i].name)

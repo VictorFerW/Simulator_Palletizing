@@ -34,17 +34,36 @@ Os sinais das mesas têm os **mesmos nomes das variáveis dos FBs** (`Bloqueio_E
 
 As caixas colocadas pelo robô passam a fazer parte do pallet e andam junto com ele pelos TDPs.
 
+## Esteira de produtos
+
+Cada esteira pode ter **sensor de entrada** e **sensor de saída** (cada um opcional, com a posição a partir do início e do fim). Com **FB da esteira sem CLP** marcado, o motor segue o FB da esteira (modo automático):
+
+- Liga com produto num sensor (ou na partida).
+- Com **AtivaAcumulo**, para com produto na saída enquanto a próxima não pode receber, ou depois de **TempoVaiPara** sem produto na entrada (se a próxima não pode receber).
+- Desliga depois de **TempoOciosidade** com os dois sensores livres.
+- Publica **EsteiraCheia** (acumulando, produto na saída, motor parado). **EsteiraPosteriorOK** vem do CLP quando há tag; sem tag, vem da próxima no fim da esteira: outra esteira que não está cheia, uma mesa com o bloqueio de entrada abaixado, um transportador com o motor ligado, ou nada.
+
+Esteiras novas e as da célula padrão já vêm com o FB ligado. Em layouts salvos antes, ele vem desligado (o motor fica sempre ligado, como antes). Se um emissor solta as caixas depois do sensor de entrada, as caixas não passam pelo sensor e a esteira não liga; o painel avisa e diz onde colocar o sensor.
+
 ## Editor
+
+No canto superior esquerdo da vista 3D ficam dois botões:
+
+- **Adicionar:** abre o catálogo, com categorias (Tudo, Robôs, Transporte, Mesas, Pallets, Outros), busca e um cartão por equipamento, com nome, características e imagem 3D. Clique no cartão para colocar o equipamento no centro da vista, ou arraste o cartão para a área 3D para soltá-lo naquele ponto do piso (na grade, se ela estiver ligada). O equipamento novo fica selecionado.
+- **Editar:** lista os objetos da cena, com imagem, nome e tipo, e uma busca. Clique para selecionar, `Ctrl`+clique para somar, duplo clique para focar a câmera, e a lixeira (que aparece ao passar o mouse) exclui. Os controles do teclado ficam em **Controles**.
+
+Clicar de novo no botão aberto fecha o painel.
 
 | Ação | Como fazer |
 |---|---|
-| Adicionar | Painel **Catálogo**: esteira, Mesa 2 estágios, Mesa pré-forma 3 estágios, TDP, TDP de paletização, robô FANUC M-410iC/185 ou KUKA KR 180 R3200-2 PA, emissor, magazine de pallets, removedor, sensor fotoelétrico |
-| Selecionar | Clique no objeto ou na lista **Cena** |
+| Adicionar | Botão **Adicionar**: clique no cartão ou arraste-o para a vista 3D |
+| Selecionar | Clique no objeto ou na lista do botão **Editar** |
 | Seleção múltipla | `Ctrl`+clique soma ou tira itens; arrastar com o botão esquerdo num espaço vazio desenha um retângulo de seleção (`Ctrl` para somar à seleção atual) |
 | Mover | Arraste qualquer item selecionado: o grupo inteiro se move (grade de 0,1 m; segure `Alt` para ignorar a grade). Setas: 0,1 m (`Shift`: 0,5 m). `PgUp`/`PgDn`: altura |
 | Rotacionar | `R` / `Shift+R`: ±90° · `Q` / `E`: ±15° (um grupo gira em torno do seu centro) · ou o campo Rotação em Propriedades |
 | Deletar | `Del` (todos os selecionados), o botão 🗑 da lista ou **Excluir** |
 | Duplicar | `Ctrl+D` (todos os selecionados) |
+| Desfazer / refazer | `Ctrl+Z` / `Ctrl+Y` (ou `Ctrl+Shift+Z`): posição, rotação, altura, valores do painel Propriedades, itens adicionados, duplicados ou excluídos. Um arraste conta como um passo só; um valor digitado entra quando você sai do campo. Até 100 passos; abrir ou criar outro projeto começa um histórico novo |
 | Câmera | Botão direito: orbitar · botão do meio ou `Shift`+direito: deslocar · roda: zoom · `F`: focar no selecionado |
 
 Com itens selecionados, segure **V** e mova o mouse para cima ou para baixo para subir ou descer a seleção (em passos da grade quando ela está ligada; **Alt** desliga o encaixe).
@@ -68,7 +87,25 @@ O arquivo do projeto (JSON) grava a célula inteira em JSON: equipamentos, vínc
 
 ## Robôs: FANUC M-410iC/185 e KUKA KR 180 R3200-2 PA
 
-O robô pode ficar acima do piso: com **Altura (Y)** maior que zero, ele é desenhado sobre um pedestal, e o braço trabalha abaixo da própria base até o limite da folha de dados (FANUC −561 mm, KUKA −742 mm). O piso de verdade continua sendo o limite: o robô só reporta "abaixo do piso" para pontos abaixo do chão da célula. Com o robô a 0,8 m, por exemplo, o topo de um pallet num TDP de 0,5 m fica 0,15 m abaixo da base e é alcançado normalmente.
+### Limites de giro dos eixos
+
+Em **Limites de giro**, no painel do robô, cada eixo (J1..J4 no FANUC; A1, A2, A3 e A6 no KUKA) tem mínimo e máximo, como os limites de software do controlador. Eles ficam sempre dentro da folha de dados, que aparece ao lado. **Voltar à folha de dados** desfaz a restrição. Um ponto fora dos limites entra no log de falhas, por exemplo "A1 precisaria de −136° (faixa −120° a 120°)".
+
+O J1 usa toda a sua faixa: o KUKA vai a ±185°, então, perto da emenda de 180°, ele escolhe o lado que gira menos; o FANUC (±180°) dá a volta longa. Com o robô selecionado, o editor desenha o J1 ao redor da base: um arco verde com as direções permitidas (em espiral, então a parte que passa de ±180° aparece duas vezes), raios vermelhos nos limites, um arco vermelho no setor proibido, uma linha verde no 0° e uma linha branca na posição atual.
+
+### Giro do punho, outros pallets e pinças
+
+- **Punho (J4/A6):** a orientação do cabeçote é escolhida para girar o motor do punho o menos possível, e não o fardo. Na coleta, que pode girar o grupo 180°, a escolha já olha o depósito seguinte e mantém o punho perto do meio da faixa. Antes o A6 ia se acumulando até ±350° e chegava a dar quase uma volta junto com o giro do J1. Quando a mesa e o pallet ficam em lados opostos, o J1 ainda gira cerca de 180°, porque é o caminho que a faixa permite.
+- **Outros pallets no caminho:** a altura de transferência considera todos os pallets (e o que já foi empilhado neles) por onde o cabeçote passa, do ponto onde o robô está até a coleta e da coleta até o depósito, e o perch também. Com um pallet alto ao lado de um baixo, o robô passa 10 cm acima do pallet alto. Se o braço não alcança essa altura naquele raio, a falha entra no log com a direção, o raio e o topo do pallet.
+- **Pinças:** ao soltar, a pinça abre só 25 mm, sem entrar nos fardos ao lado, e abre toda depois de subir. A escolha de qual fardo vai em qual posição, e de que lado, também evita que a pinça que segura o segundo fardo desça sobre um fardo já colocado. Num padrão sem folga entre as unidades (por exemplo, a amarração com folga 0), a chapa da pinça (12 mm) ainda encosta no vizinho quando ele fica do lado da pinça. Para cabeçote de pinças, use **Folga entre unidades** de pelo menos 20 mm na tela de padrões.
+- **Cavalete e corpo do robô:** o cavalete e o corpo que gira com o J1 (coluna e carcaça do J2/A2; no KUKA, de 0,75 m atrás a 0,53 m à frente do eixo, ±0,45 m de largura e até 0,90 m acima da base) são obstáculos. Quando o cabeçote passa perto do robô, a transferência sobe acima deles. Se na coleta ou num depósito o cabeçote (quadro de 1234 × 500 mm, na orientação real) bateria no cavalete ou no corpo, o robô não vai e o log de falhas diz qual posição e por quê, por exemplo "depósito no TDP_Palet_2 (posição 2 do padrão): o cabeçote bateria no cavalete (TCP a 1,21 m de raio e −0,50 m de altura)". Nesse caso, afaste o TDP do robô ou suba o robô.
+- Com `PDT_TRACE=1`, o terminal mostra cada colisão do fardo carregado, do quadro do cabeçote ou de uma pinça com pallets, fardos já colocados, o cavalete e o corpo do robô.
+
+### Cavalete (base do robô)
+
+Qualquer robô pode ficar sobre o **cavalete base robô Selgron (01F11M000520)**: marque **Cavalete (base)** no painel do robô. O cavalete é o quadro tubular do desenho: quatro colunas sobre chapas chumbadas, duas vigas superiores com a chapa de fixação do robô, um anel de vigas a meia altura e diagonais nos lados longos. Valores iniciais: 1150 mm de largura e 1594,5 mm de altura (do desenho) e 1600 mm de comprimento (estimado). Altura, largura, comprimento e giro (em relação ao robô) são editáveis. O topo do cavalete é a altura da base do robô: a **Altura (Y)** do robô acompanha a altura do cavalete.
+
+O robô também pode ficar acima do piso sem o cavalete (só com a **Altura (Y)**). Em qualquer caso, o braço trabalha abaixo da própria base até o limite da folha de dados (FANUC −561 mm, KUKA −742 mm). O piso de verdade continua sendo o limite: o robô só reporta "abaixo do piso" para pontos abaixo do chão da célula. Com o robô a 0,8 m, por exemplo, o topo de um pallet num TDP de 0,5 m fica 0,15 m abaixo da base e é alcançado normalmente.
 
 Há dois modelos no catálogo: **Robô FANUC M-410iC/185** e **Robô KUKA KR 180 R3200-2 PA**. No painel do robô, **Modelo** troca o modelo de um robô já colocado (ele volta à posição de repouso do novo modelo). Cada modelo tem a sua cinemática, faixas, velocidades, envelope e modelo 3D do fabricante. O cabeçote, o programa de paletização, as rotas e o log de falhas são os mesmos.
 
@@ -301,6 +338,10 @@ src/
 tools/TiaOpennessBridge/   auxiliar .NET Framework 4.8 (Openness V18)
 docs/openness-contract.json  contrato JSON entre o app e o auxiliar
 ```
+
+## Imagens do catálogo
+
+As imagens de `assets/thumbnails/` são geradas pelo próprio simulador: com `PDT_THUMBS=<pasta>`, ele monta cada equipamento do catálogo sozinho, sem piso e com fundo cinza, enquadra a câmera, salva uma captura por item e sai. Depois, as capturas são recortadas e reduzidas para 256 × 256. Rode com `BEVY_ASSET_ROOT` apontando para a pasta do projeto, para que os robôs usem os modelos 3D do fabricante.
 
 ## Testes
 

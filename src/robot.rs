@@ -20,6 +20,12 @@ use crate::sim::{self, Load, LoadKind, LoadState, PalletLoad, PalletizerState};
 pub const TOOL_LENGTH: f32 = 0.435;
 /// Clamp (pinça) half opening when open, and its height below the frame.
 pub const JAW_OPEN: f32 = 0.60;
+/// Clamp opening while releasing in the layer: just enough to let the fardo go,
+/// without going into the fardos beside it; it opens fully once lifted.
+pub const JAW_RELEASE: f32 = 0.025;
+/// Clamp plate thickness and its gap to the fardo when closed.
+pub const JAW_THICKNESS: f32 = 0.012;
+pub const JAW_GAP: f32 = 0.008;
 pub const JAW_HEIGHT: f32 = 0.295;
 
 const DEG: f32 = PI / 180.0;
@@ -30,6 +36,7 @@ const DEG: f32 = PI / 180.0;
 /// are the lower arm from the vertical (forward positive) and the upper arm
 /// elevation from the horizontal; [`Kin::to_motor`] gives the manufacturer's axes,
 /// where the data sheet ranges and speeds apply.
+#[derive(Clone)]
 pub struct Kin {
     pub model: RobotModel,
     /// Axis names J1..J4 (FANUC) or A1, A2, A3, A6 (KUKA; A5 keeps the flange level).
@@ -71,10 +78,18 @@ pub struct Kin {
     pub home: Pose,
     /// Speeds of the robot program (m/s, linear moves).
     pub program: Program,
+    /// Body turning with J1 (column, J2/A2 housing), in the J1 direction: from
+    /// `body_back` behind to `body_front` ahead of the axis, `body_half_width` to each
+    /// side, up to `body_top` above the robot base.
+    pub body_front: f32,
+    pub body_back: f32,
+    pub body_half_width: f32,
+    pub body_top: f32,
 }
 
 /// Linear speeds and limits of the robot program: FANUC TP routines PICK/PLACE
 /// (Selgron), KUKA KRL MovePick/MovePlace/MovePerch.
+#[derive(Clone)]
 pub struct Program {
     pub pick: &'static str,
     pub place: &'static str,
@@ -127,6 +142,11 @@ pub static FANUC: Kin = Kin {
         place_up: 4.0,
         max_travel_y: f32::INFINITY,
     },
+    // Turntable and J2 housing of the STEP (the pedestal is not drawn).
+    body_front: 0.49,
+    body_back: 0.45,
+    body_half_width: 0.40,
+    body_top: 1.36,
 };
 
 /// KUKA data sheet, KR 180 R3200-2 PA (0000-361-137 / V5.1): 180 kg, reach 3195 mm,
@@ -174,6 +194,12 @@ pub static KUKA: Kin = Kin {
         place_up: 3.0,
         max_travel_y: 2.0,
     },
+    // Rotating column with the A2 gearbox and motors (STEP): 0.53 m ahead and
+    // 0.75 m behind A1, up to the A2 hub (0.645 + 0.25 m).
+    body_front: 0.53,
+    body_back: 0.75,
+    body_half_width: 0.45,
+    body_top: 0.90,
 };
 
 pub fn kin(model: RobotModel) -> &'static Kin {
@@ -184,6 +210,31 @@ pub fn kin(model: RobotModel) -> &'static Kin {
 }
 
 impl Kin {
+    /// This model with the robot's software limits (degrees, manufacturer's axes,
+    /// `[min, max]` per axis), each kept inside the data sheet range. Empty or a
+    /// missing axis: the data sheet range.
+    pub fn with_limits(&self, limits: &[[f32; 2]]) -> Kin {
+        let mut kin = self.clone();
+        for (i, [lo, hi]) in limits.iter().take(4).enumerate() {
+            let (lo, hi) = (lo.to_radians().max(self.min[i]), hi.to_radians().min(self.max[i]));
+            if lo < hi {
+                kin.min[i] = lo;
+                kin.max[i] = hi;
+            }
+        }
+        kin
+    }
+
+    /// J1 for the direction `theta`: `theta` or a full turn away, inside the J1 range
+    /// (the KUKA goes to ±185°), the one closest to `near`.
+    pub fn j1_near(&self, theta: f32, near: f32) -> f32 {
+        [theta, theta + 2.0 * PI, theta - 2.0 * PI]
+            .into_iter()
+            .filter(|j| *j >= self.min[0] - 1e-4 && *j <= self.max[0] + 1e-4)
+            .min_by(|a, b| (a - near).abs().total_cmp(&(b - near).abs()))
+            .unwrap_or(theta)
+    }
+
     /// Flange face to the bottom of the cabeçote frame.
     pub fn frame_drop(&self) -> f32 {
         self.wrist_drop + TOOL_LENGTH
@@ -227,7 +278,7 @@ impl Kin {
     pub fn axes(&self, pose: &Pose) -> Axes {
         let joints = self.solve(pose);
         Axes([
-            pose.theta,
+            self.j1_near(pose.theta, pose.theta),
             FRAC_PI_2 - joints.shoulder,
             joints.upper_dir.y.atan2(joints.upper_dir.x),
             pose.yaw - pose.theta,
@@ -294,7 +345,7 @@ impl Kin {
         let upper_dir = (wrist - elbow).normalize_or_zero();
         let j2 = FRAC_PI_2 - shoulder;
         let j3 = upper_dir.y.atan2(upper_dir.x);
-        let axes = Axes([pose.theta, j2, j3, pose.yaw - pose.theta]);
+        let axes = Axes([self.j1_near(pose.theta, pose.theta), j2, j3, pose.yaw - pose.theta]);
         Joints {
             j1: pose.theta,
             shoulder,
@@ -337,24 +388,38 @@ impl Kin {
         lo
     }
 
-    /// Gripper yaw for exactly `target` (full turns only) closest to `current`, with
-    /// J4 (yaw relative to J1 at `theta`) inside its range.
-    fn wrist_yaw_exact(&self, current: f32, target: f32, theta: f32) -> f32 {
+    /// J4 inside its range for the gripper yaw `y` with J1 at `theta`.
+    fn j4_ok(&self, y: f32, theta: f32) -> bool {
+        let j4 = y - theta;
+        j4 >= self.min[3] - 1e-4 && j4 <= self.max[3] + 1e-4
+    }
+
+    /// Gripper yaw for exactly `target` (full turns only) with J1 at `theta`: the one
+    /// that turns the J4/A6 motor the least from the current pose (the flange turns
+    /// with J1 too, so the yaw closest to the current one can cost almost a full turn
+    /// of the wrist after a half turn of J1).
+    fn wrist_yaw_exact(&self, current: &Pose, target: f32, theta: f32) -> f32 {
+        let j4 = current.yaw - current.theta;
+        let cost = |y: f32| ((y - theta) - j4).powi(2) + 0.25 * (y - theta).powi(2);
         (-4..=4)
             .map(|k| target + k as f32 * 2.0 * PI)
-            .filter(|y| (y - theta).abs() <= self.max[3])
-            .min_by(|a, b| (a - current).abs().total_cmp(&(b - current).abs()))
+            .filter(|y| self.j4_ok(*y, theta))
+            .min_by(|a, b| cost(*a).total_cmp(&cost(*b)))
             .unwrap_or(target)
     }
 
-    /// Gripper yaw for `target` (any half turn) closest to `current`, keeping J4
-    /// (yaw relative to J1 at `theta`) inside its range.
-    fn wrist_yaw(&self, current: f32, target: f32, theta: f32) -> f32 {
+    /// Gripper yaw for `target` (any half turn) with J1 at `theta`, turning the J4/A6
+    /// motor the least from the current pose (see [`Kin::wrist_yaw_exact`]) and keeping
+    /// it toward the middle of its range: a wrist that drifted to one end needs almost
+    /// a full turn back at the next exact placement.
+    fn wrist_yaw(&self, current: &Pose, target: f32, theta: f32) -> f32 {
+        let j4 = current.yaw - current.theta;
+        let cost = |y: f32| ((y - theta) - j4).powi(2) + 0.5 * (y - theta).powi(2);
         (-8..=8)
             .map(|k| target + k as f32 * PI)
-            .filter(|y| (y - theta).abs() <= self.max[3])
-            .min_by(|a, b| (a - current).abs().total_cmp(&(b - current).abs()))
-            .unwrap_or_else(|| nearest_half_turn(current, target))
+            .filter(|y| self.j4_ok(*y, theta))
+            .min_by(|a, b| cost(*a).total_cmp(&cost(*b)))
+            .unwrap_or_else(|| nearest_half_turn(current.yaw, target))
     }
 
     /// Why the TCP point `p` (robot frame) is out of reach: distance of the arm, axis
@@ -384,7 +449,7 @@ impl Kin {
         }
         let axes = self.axes(&pose);
         let motor = self.to_motor(axes);
-        for (i, m) in motor.iter().enumerate().take(3).skip(1) {
+        for (i, m) in motor.iter().enumerate().take(3) {
             let (q, lo, hi) = (m.to_degrees(), self.min[i].to_degrees(), self.max[i].to_degrees());
             if q < lo - 0.01 || q > hi + 0.01 {
                 why.push(format!("{} precisaria de {q:.0}° (faixa {lo:.0}° a {hi:.0}°)", self.axis_names[i]));
@@ -571,8 +636,6 @@ pub enum RobotPart {
     /// Clamps of the cabeçote, on either side (`-Z` / `+Z` of the gripper).
     JawA,
     JawB,
-    /// Pedestal from the floor to the robot base, when the robot is mounted higher.
-    Pedestal,
 }
 
 /// TCP pose in the robot frame, cylindrical: angle around J1, radius, height,
@@ -644,7 +707,7 @@ pub struct Drop {
 #[derive(Component)]
 pub struct RobotState {
     /// Model of this robot (kinematics, limits, speeds).
-    pub kin: &'static Kin,
+    pub kin: Kin,
     pub pose: Pose,
     from: Pose,
     to: Pose,
@@ -688,24 +751,38 @@ pub struct RobotState {
     pub faults: Vec<(f32, String)>,
     /// Faults of the last planning attempt: a fault is logged when it appears.
     active_faults: Vec<String>,
+    /// Cavalete under the robot (from its parameters).
+    pub base: Option<RobotBase>,
 }
 
 impl Default for RobotState {
     fn default() -> Self {
-        Self::new(&FANUC)
+        Self::new(FANUC.clone())
     }
 }
 
 impl RobotState {
-    pub fn new(kin: &'static Kin) -> Self {
+    /// Clamp position from the gripper center along its Z (`jaw` 1 = closed): open
+    /// only a little while down at the place, fully elsewhere.
+    fn jaw_half(&self, closed: f32, jaw: f32) -> f32 {
+        let open = if matches!(self.step, Step::DownPlace | Step::Release | Step::Lift) {
+            (closed + JAW_RELEASE).min(JAW_OPEN)
+        } else {
+            JAW_OPEN
+        };
+        open + (closed.min(JAW_OPEN) - open) * jaw
+    }
+
+    pub fn new(kin: Kin) -> Self {
         let home = kin.home;
+        let home_axes = kin.axes(&home);
         Self {
             kin,
             pose: home,
             from: home,
             to: home,
-            from_axes: kin.axes(&home),
-            to_axes: kin.axes(&home),
+            from_axes: home_axes,
+            to_axes: home_axes,
             motion: Move::Joint,
             t: 0.0,
             duration: 0.0,
@@ -733,6 +810,7 @@ impl RobotState {
             cycles: 0,
             faults: Vec::new(),
             active_faults: Vec::new(),
+            base: None,
         }
     }
 
@@ -745,7 +823,13 @@ impl RobotState {
     /// plus the acceleration ramps.
     fn move_to(&mut self, to: Pose, speed_override: f32, motion: Move) {
         let ovr = speed_override.clamp(0.05, 1.0);
-        let (a, b) = (self.kin.axes(&self.pose), self.kin.axes(&to));
+        let (a, mut b) = (self.kin.axes(&self.pose), self.kin.axes(&to));
+        // J1: the way allowed by its range that turns the least (a full turn away
+        // when the range passes ±180°).
+        b.0[0] = self.kin.j1_near(b.0[0], a.0[0]);
+        if std::env::var("PDT_TRACE_J1").is_ok() {
+            eprintln!("J1 {:?} {:.1} -> {:.1} (giro {:.1}) J4 {:.1} -> {:.1}", motion, a.0[0].to_degrees(), b.0[0].to_degrees(), (b.0[0] - a.0[0]).to_degrees(), a.0[3].to_degrees(), b.0[3].to_degrees());
+        }
         // Data sheet speeds apply to the manufacturer's axes (KUKA A3 between the arms).
         let (ma, mb) = (self.kin.to_motor(a), self.kin.to_motor(b));
         let axes_time = (0..4).map(|i| (mb[i] - ma[i]).abs() / (self.kin.speed[i] * ovr)).fold(0.0, f32::max);
@@ -871,6 +955,30 @@ struct Plan {
 }
 
 /// Footprint overlap area of two products (yaw multiples of 90°).
+/// Penetration of two boxes turned around Y (center, half size, yaw): the smallest
+/// overlap over the separating axes (the two pairs of sides and the vertical), or None
+/// when they do not touch.
+fn obb_depth(a: Vec3, ha: Vec3, a_yaw: f32, b: Vec3, hb: Vec3, b_yaw: f32) -> Option<f32> {
+    let vertical = ha.y + hb.y - (a.y - b.y).abs();
+    if vertical <= 0.0 {
+        return None;
+    }
+    let axes = |yaw: f32| [Vec2::new(yaw.cos(), -yaw.sin()), Vec2::new(yaw.sin(), yaw.cos())];
+    let (aa, ab) = (axes(a_yaw), axes(b_yaw));
+    let d = Vec2::new(b.x - a.x, b.z - a.z);
+    let mut depth = vertical;
+    for n in aa.iter().chain(ab.iter()) {
+        let ra = ha.x * aa[0].dot(*n).abs() + ha.z * aa[1].dot(*n).abs();
+        let rb = hb.x * ab[0].dot(*n).abs() + hb.z * ab[1].dot(*n).abs();
+        let overlap = ra + rb - d.dot(*n).abs();
+        if overlap <= 0.0 {
+            return None;
+        }
+        depth = depth.min(overlap);
+    }
+    Some(depth)
+}
+
 fn overlap(a: Vec3, a_yaw: f32, b: Vec3, b_yaw: f32, size: Vec3) -> f32 {
     let half = |yaw: f32| {
         if yaw.sin().abs() > 0.7 { Vec2::new(size.z, size.x) / 2.0 } else { Vec2::new(size.x, size.z) / 2.0 }
@@ -927,6 +1035,13 @@ fn pattern_drops(p: &crate::pattern::Pattern, pallet_h: f32, held: &[HeldBox], s
     let mut occupied: Vec<(Vec3, f32)> = filled.iter().filter_map(|&s| place(s)).collect();
     let mut remaining: Vec<usize> = (0..held.len()).collect();
     remaining.sort_by(|&a, &b| held[a].offset.z.total_cmp(&held[b].offset.z));
+    // Clamp plates: on both sides of the held group along its Z, closed against it.
+    let half_z = |b: &HeldBox| if b.rel_yaw.sin().abs() > 0.7 { size.x / 2.0 } else { size.z / 2.0 };
+    let group_lo = held.iter().map(|b| b.offset.z - half_z(b)).fold(f32::MAX, f32::min);
+    let group_hi = held.iter().map(|b| b.offset.z + half_z(b)).fold(f32::MIN, f32::max);
+    let jaw_off = JAW_GAP + JAW_THICKNESS / 2.0;
+    let jaws = [group_lo - jaw_off, group_hi + jaw_off];
+    let jaw_half = Vec3::new(0.25, 0.1, JAW_THICKNESS / 2.0);
     let mut drops = Vec::new();
     for slots in &spec {
         let k = slots.len();
@@ -957,6 +1072,16 @@ fn pattern_drops(p: &crate::pattern::Pattern, pallet_h: f32, held: &[HeldBox], s
                 for (n, &b) in subset.iter().enumerate() {
                     if !aligned(gamma + held[b].rel_yaw, spots[order[n]].1) {
                         score += 100.0;
+                    }
+                }
+                // The clamps come down beside the group: not into a fardo of the layer.
+                let layer: Vec<&(Vec3, f32)> = occupied.iter().filter(|(o, _)| (o.y - spots[0].0.y).abs() < 0.02).collect();
+                for z in jaws {
+                    let jaw = centre + rot * Vec3::new(0.0, 0.0, z);
+                    for (o, oy) in &layer {
+                        if let Some(depth) = obb_depth(Vec3::new(jaw.x, o.y, jaw.z), jaw_half, gamma, *o, size / 2.0, *oy) {
+                            score += depth * 0.5;
+                        }
                     }
                 }
                 for &j in remaining.iter().filter(|j| !subset.contains(j)) {
@@ -994,6 +1119,117 @@ fn pattern_drops(p: &crate::pattern::Pattern, pallet_h: f32, held: &[HeldBox], s
 
 type LoadQuery<'w, 's> = Query<'w, 's, (Entity, &'static mut Load, &'static mut Transform), Without<Equipment>>;
 
+/// A pallet (with what is stacked on it) the gripper may pass over, in the robot
+/// frame: direction (J1 angle), radius, half of its diagonal and top height.
+#[derive(Clone, Copy)]
+struct Stack {
+    theta: f32,
+    r: f32,
+    half: f32,
+    top: f32,
+    /// How close the gripper center may come: its half size seen from the stack.
+    reach: f32,
+}
+
+/// Every pallet on the floor or on a conveyor, with the top of its stack.
+fn stacks(loads: &LoadQuery, world_to_local: &Affine3A) -> Vec<Stack> {
+    let mut out: Vec<(Entity, Stack)> = loads
+        .iter()
+        .filter(|(_, l, _)| l.kind == LoadKind::Pallet && l.state == LoadState::Free)
+        .map(|(e, l, tf)| {
+            let c = world_to_local.transform_point3(tf.translation);
+            let stack = Stack {
+                theta: (-c.z).atan2(c.x),
+                r: Vec2::new(c.x, c.z).length(),
+                half: Vec2::new(l.size.x, l.size.z).length() / 2.0,
+                top: c.y + l.size.y / 2.0,
+                reach: GRIPPER_REACH,
+            };
+            (e, stack)
+        })
+        .collect();
+    // Fardos placed on a pallet are its children (pallet frame).
+    for (_, l, tf) in loads.iter() {
+        if let LoadState::Placed(pallet) = l.state
+            && let Some((_, stack)) = out.iter_mut().find(|(e, _)| *e == pallet)
+            && let Ok((_, _, ptf)) = loads.get(pallet)
+        {
+            let top = world_to_local.transform_point3(ptf.transform_point(tf.translation)).y + l.size.y / 2.0;
+            stack.top = stack.top.max(top);
+        }
+    }
+    out.into_iter().map(|(_, s)| s).collect()
+}
+
+/// Gripper (cabeçote) half length plus the carried fardos beyond it.
+const GRIPPER_REACH: f32 = 0.70;
+
+/// Highest stack under the path of the TCP turning J1 from `a` to `b` (angle, radius;
+/// J1 unwrapped as the robot turns) with the gripper, or None.
+fn highest_on_path(stacks: &[Stack], a: (f32, f32), b: (f32, f32)) -> Option<&Stack> {
+    let (lo, hi) = (a.0.min(b.0), a.0.max(b.0));
+    let (r_lo, r_hi) = (a.1.min(b.1), a.1.max(b.1));
+    stacks
+        .iter()
+        .filter(|s| {
+            let reach = s.half + s.reach;
+            let in_band = s.r + reach >= r_lo && s.r - reach <= r_hi;
+            let w = if s.r > reach { (reach / s.r).asin() } else { PI };
+            in_band && (-1..=1).any(|k| {
+                let t = s.theta + k as f32 * 2.0 * PI;
+                t >= lo - w && t <= hi + w
+            })
+        })
+        .max_by(|x, y| x.top.total_cmp(&y.top))
+}
+
+/// Cabeçote frame half sizes (500 x 1234 mm): along its X and Z.
+const FRAME_HALF: Vec2 = Vec2::new(0.25, 0.617);
+
+/// The robot itself as obstacles for the path: the cavalete under it (top at the
+/// robot base) and its body, which always faces the arm (so only its front counts).
+fn self_stacks(kin: &Kin, base: Option<RobotBase>) -> Vec<Stack> {
+    let mut out = vec![Stack { theta: 0.0, r: 0.0, half: kin.body_front, top: kin.body_top, reach: FRAME_HALF.y }];
+    if let Some(b) = base {
+        out.push(Stack { theta: 0.0, r: 0.0, half: Vec2::new(b.depth, b.width).length() / 2.0, top: 0.0, reach: FRAME_HALF.y });
+    }
+    out
+}
+
+/// Cavalete under the robot, in the robot frame.
+#[derive(Clone, Copy, Debug)]
+pub struct RobotBase {
+    pub height: f32,
+    pub width: f32,
+    pub depth: f32,
+    /// Turn relative to the robot (rad).
+    pub yaw: f32,
+}
+
+/// What the cabeçote (frame and carried fardos, TCP at its bottom) would hit with the
+/// TCP at `tcp` (robot frame) and gripper yaw `yaw`: the cavalete or the robot body
+/// (turned to `theta`, the J1 direction). None when clear.
+fn self_hit(kin: &Kin, base: Option<RobotBase>, tcp: Vec3, yaw: f32, theta: f32) -> Option<&'static str> {
+    let frame = Vec3::new(FRAME_HALF.x, 0.0, FRAME_HALF.y);
+    let flat = |p: Vec3| Vec3::new(p.x, 0.0, p.z);
+    if let Some(b) = base
+        && tcp.y < 0.02
+        && obb_depth(flat(tcp), frame + Vec3::Y, yaw, Vec3::ZERO, Vec3::new(b.depth / 2.0, 1.0, b.width / 2.0), b.yaw).is_some_and(|d| d > 0.005)
+    {
+        return Some("o cavalete");
+    }
+    let along = (kin.body_front - kin.body_back) / 2.0;
+    let center = Vec3::new(along * theta.cos(), 0.0, -along * theta.sin());
+    let half = Vec3::new((kin.body_front + kin.body_back) / 2.0, 1.0, kin.body_half_width);
+    if tcp.y < kin.body_top && obb_depth(flat(tcp), frame + Vec3::Y, yaw, center, half, theta).is_some_and(|d| d > 0.005) {
+        return Some("o corpo do robô (coluna)");
+    }
+    None
+}
+
+/// Clearance of the TCP (bottom of the gripper and of the carried fardos) over a stack.
+const STACK_CLEARANCE: f32 = 0.10;
+
 /// Plans taking everything resting in the pick area of `pick` (a pair of fardos
 /// on a mesa, one box on a belt) to the next slot of the pallet on `tdp`.
 #[allow(clippy::too_many_arguments)]
@@ -1006,7 +1242,7 @@ fn plan_cycle(
     loads: &LoadQuery,
     pallet_loads: &Query<&mut PalletLoad>,
 ) -> Result<Plan, Failure> {
-    let kin = state.kin;
+    let kin = &state.kin;
     let robot_yaw = yaw_of(robot_tf.rotation);
     let mut group: Vec<(Entity, Vec3, Quat, Vec3)> = loads
         .iter()
@@ -1169,7 +1405,102 @@ fn plan_cycle(
             tops.iter().map(|t| radial(*t)).fold(0.0, f32::max),
         )));
     }
-    let grip_yaw = kin.wrist_yaw(state.pose.yaw, group_yaw - robot_yaw, pick_pose.theta);
+    // Other pallets on the way (a tall one next to the pallet being built): the arm
+    // passes above them, from where it is to the pick and from the pick to the place.
+    let mut obstacles = stacks(loads, world_to_local);
+    obstacles.extend(self_stacks(kin, state.base));
+    let j1_now = kin.axes(&state.pose).0[0];
+    let j1_at_pick = kin.j1_near(pick_pose.theta, j1_now);
+    let j1_at_place = kin.j1_near(Pose::from_local(tops[0], 0.0).theta, j1_at_pick);
+    let place_r = tops.iter().map(|t| radial(*t)).fold(0.0, f32::max);
+    let over = |stack: Option<&Stack>, limit: f32, what: &str| -> Result<f32, Failure> {
+        let Some(s) = stack else { return Ok(f32::MIN) };
+        let need = s.top + STACK_CLEARANCE;
+        if need > limit {
+            return Err(Failure::Fault(format!(
+                "{what}: precisa passar sobre o pallet a {:.0}° e {:.2} m de raio (topo a {:.2} m) a {:.2} m, e o braço só sobe até {:.2} m",
+                s.theta.to_degrees(),
+                s.r,
+                s.top,
+                need,
+                limit + 0.02
+            )));
+        }
+        Ok(need)
+    };
+    // The stack the robot is above now (it just placed there) is left upward.
+    let here = state.pose.local_point();
+    let leaving: Vec<Stack> = obstacles
+        .iter()
+        .filter(|s| {
+            let center = Vec2::new(s.r * s.theta.cos(), -s.r * s.theta.sin());
+            !(s.r > 0.0 && center.distance(Vec2::new(here.x, here.z)) < s.half && here.y >= s.top)
+        })
+        .map(|s| Stack { ..*s })
+        .collect();
+    let to_pick = over(highest_on_path(&leaving, (j1_now, state.pose.r), (j1_at_pick, radial(local_pick))), pick_ceiling, &format!("caminho até a coleta em {}", pick_eq.name))?;
+    let to_place = over(highest_on_path(&obstacles, (j1_at_pick, radial(local_pick)), (j1_at_place, place_r)), ceiling, &format!("caminho até o {}", tdp_eq.name))?;
+    if std::env::var("PDT_TRACE").is_ok() && to_place > safe_y {
+        eprintln!("{}: transferência sobe para {to_place:.2} m (outro pallet no caminho; camada pedia {safe_y:.2} m)", tdp_eq.name);
+    }
+    let safe_y = safe_y.max(to_place);
+    // Gripper yaw at the pick (any half turn of the group): the one whose J4/A6 turns
+    // the least now and at the first placement (exact or half turn there), kept
+    // toward the middle of its range.
+    let j4_now = state.pose.yaw - state.pose.theta;
+    let place_theta = Pose::from_local(tops[0], 0.0).theta;
+    // Turn of the group from the pick to the first placement (world).
+    let delta = yaw_of(pallet_tf.rotation) + drops[0].yaw - group_yaw;
+    let place_step = if drops[0].exact { 2.0 * PI } else { PI };
+    // J1 at the pick and at the place along the way the robot will turn: the flange
+    // (and the fardos) turn by J1 + J4 in the world, so of two equal wrist turns the
+    // one that does not spin the fardos a full turn is taken.
+    let j1_pick = kin.j1_near(pick_pose.theta, kin.axes(&state.pose).0[0]);
+    let j1_place = kin.j1_near(place_theta, j1_pick);
+    let grip_yaw = (-8..=8)
+        .map(|k| group_yaw - robot_yaw + k as f32 * PI)
+        .filter(|g| kin.j4_ok(*g, pick_pose.theta))
+        .filter_map(|g| {
+            let j4_pick = g - pick_pose.theta;
+            let place_cost = |j4: f32| {
+                let spin = (j1_place + j4) - (j1_pick + j4_pick);
+                (j4 - j4_pick).powi(2) + 0.25 * j4.powi(2) + 0.1 * spin.powi(2)
+            };
+            let j4_place = (-8..=8)
+                .map(|k| g + delta + k as f32 * place_step)
+                .filter(|y| kin.j4_ok(*y, place_theta))
+                .map(|y| y - place_theta)
+                .min_by(|a, b| place_cost(*a).total_cmp(&place_cost(*b)))?;
+            // Squares: one large turn costs more than two medium ones.
+            let cost = (j4_pick - j4_now).powi(2) + (j4_place - j4_pick).powi(2) + 0.5 * (j4_pick.powi(2) + j4_place.powi(2));
+            Some((g, cost))
+        })
+        .min_by(|a, b| a.1.total_cmp(&b.1))
+        .map_or_else(|| kin.wrist_yaw(&state.pose, group_yaw - robot_yaw, pick_pose.theta), |(g, _)| g);
+    // The cabeçote at the pick and at each place: not into the cavalete nor the body.
+    if let Some(what) = self_hit(kin, state.base, local_pick, grip_yaw, pick_pose.theta) {
+        return Err(Failure::Fault(format!(
+            "coleta em {}: o cabeçote bateria n{} (TCP a {:.2} m de raio e {:.2} m de altura)",
+            pick_eq.name,
+            what,
+            radial(local_pick),
+            local_pick.y
+        )));
+    }
+    for (d, t) in drops.iter().zip(&tops) {
+        let yaw = grip_yaw + yaw_of(pallet_tf.rotation) + d.yaw - group_yaw;
+        if let Some(what) = self_hit(kin, state.base, *t, yaw, Pose::from_local(*t, 0.0).theta) {
+            let slots: Vec<String> = d.slots.iter().map(|s| (s + 1).to_string()).collect();
+            return Err(Failure::Fault(format!(
+                "depósito no {}{}: o cabeçote bateria n{} (TCP a {:.2} m de raio e {:.2} m de altura): afaste o TDP do robô ou suba o robô",
+                tdp_eq.name,
+                if slots.is_empty() { String::new() } else { format!(" (posição {} do padrão)", slots.join(", ")) },
+                what,
+                radial(*t),
+                t.y
+            )));
+        }
+    }
     Ok(Plan {
         held,
         unit,
@@ -1178,23 +1509,31 @@ fn plan_cycle(
         pallet: pallet_entity,
         drops,
         safe_y,
-        above: Pose { y: safe_y.min(pick_ceiling).max(pick_pose.y), yaw: grip_yaw, ..pick_pose },
+        above: Pose { y: safe_y.min(pick_ceiling).max(pick_pose.y).max(to_pick), yaw: grip_yaw, ..pick_pose },
         next_size,
     })
 }
 
 /// Perch (wait) pose of MOVE_PERCH: over the middle of the pick area, the
 /// gripper aligned with the conveyor, high enough to clear the incoming fardos.
-fn perch_pose(state: &RobotState, world_to_local: &Affine3A, robot_yaw: f32, pick_eq: &Equipment, pick_tf: &Transform) -> Option<Pose> {
-    let kin = state.kin;
+fn perch_pose(state: &RobotState, world_to_local: &Affine3A, robot_yaw: f32, (pick_eq, pick_tf): (&Equipment, &Transform), loads: &LoadQuery) -> Option<Pose> {
+    let kin = &state.kin;
     let p = &pick_eq.params;
     let end = p.length / 2.0;
     let x = crate::conveyor::layout(pick_eq).pick_x0.map_or(end - 0.3, |x0| (x0 + end) / 2.0);
     let world = pick_tf.transform_point(Vec3::new(x, p.height + p.box_size[1] + 0.35, 0.0));
     let mut local = world_to_local.transform_point3(world);
-    local.y = local.y.min(kin.max_tcp_height(radial(local)) - 0.02);
+    // Above the pallets on the way there.
     let theta = Pose::from_local(local, 0.0).theta;
-    let yaw = kin.wrist_yaw(state.pose.yaw, yaw_of(pick_tf.rotation) - robot_yaw, theta);
+    let j1_now = kin.axes(&state.pose).0[0];
+    let mut all = stacks(loads, world_to_local);
+    all.extend(self_stacks(kin, state.base));
+    let on_path = highest_on_path(&all, (j1_now, state.pose.r), (kin.j1_near(theta, j1_now), radial(local)));
+    if let Some(s) = on_path {
+        local.y = local.y.max(s.top + STACK_CLEARANCE);
+    }
+    local.y = local.y.min(kin.max_tcp_height(radial(local)) - 0.02);
+    let yaw = kin.wrist_yaw(&state.pose, yaw_of(pick_tf.rotation) - robot_yaw, theta);
     let pose = Pose::from_local(local, yaw);
     kin.solve(&pose).reachable.then_some(pose)
 }
@@ -1240,11 +1579,21 @@ pub fn robot_program(
     claims.waiting.retain(|_, r| alive.contains(r));
     for (robot_entity, robot_eq, robot_tf, mut state, mut io) in &mut robots {
         let params = &robot_eq.params;
-        let kin = kin(params.robot_model);
-        if !std::ptr::eq(state.kin, kin) {
+        // Model with this robot's software limits.
+        let kin = &kin(params.robot_model).with_limits(&params.axis_limits);
+        if state.kin.model != kin.model {
             // Model changed: start over from its home position.
-            *state = RobotState::new(kin);
+            *state = RobotState::new(kin.clone());
+        } else {
+            state.kin.min = kin.min;
+            state.kin.max = kin.max;
         }
+        state.base = params.robot_base.then(|| RobotBase {
+            height: params.base_height,
+            width: params.base_width,
+            depth: params.base_depth,
+            yaw: params.base_yaw.to_radians(),
+        });
         let world_to_local = robot_tf.compute_affine().inverse();
         let robot_yaw = yaw_of(robot_tf.rotation);
         let in_reach = |p: Vec3, margin: f32| {
@@ -1418,7 +1767,7 @@ pub fn robot_program(
                         // MOVE_PERCH: wait over the coleta of the next mesa, at the infeed height.
                         if !state.perched
                             && let Some(&(_, pick_eq, pick_tf)) = picks.first()
-                            && let Some(perch) = perch_pose(&state, &world_to_local, robot_yaw, pick_eq, pick_tf)
+                            && let Some(perch) = perch_pose(&state, &world_to_local, robot_yaw, (pick_eq, pick_tf), &loads)
                         {
                             state.perched = true;
                             state.status = format!("Perch: {}", state.status);
@@ -1535,9 +1884,9 @@ pub fn robot_program(
                         let above = Pose::from_local(local, 0.0);
                         let target_yaw = group_world_yaw - state.hold_yaw - robot_yaw;
                         let yaw = if drop.exact {
-                            kin.wrist_yaw_exact(state.pose.yaw, target_yaw, above.theta)
+                            kin.wrist_yaw_exact(&state.pose, target_yaw, above.theta)
                         } else {
-                            kin.wrist_yaw(state.pose.yaw, target_yaw, above.theta)
+                            kin.wrist_yaw(&state.pose, target_yaw, above.theta)
                         };
                         if state.step == Step::UpPick {
                             let target = Pose { y: state.safe_y, yaw, ..above };
@@ -1651,28 +2000,67 @@ pub fn robot_program(
                     box_tf.rotation = Quat::from_rotation_y(group_yaw + item.rel_yaw);
                 }
             }
-            // Diagnostic (PDT_TRACE): a carried fardo going through the fardos on the pallet.
-            if std::env::var("PDT_TRACE").is_ok()
-                && matches!(state.step, Step::Lift | Step::ToAbovePlace | Step::DownPlace)
-                && let Some(pallet) = state.pallet
-                && let Ok((_, _, ptf)) = loads.get(pallet)
-            {
-                let ptf = *ptf;
-                let held: Vec<(Vec3, f32, Vec3)> = state
+            // Diagnostic (PDT_TRACE): the carried fardos or the cabeçote (frame, clamps)
+            // going through pallets or fardos already placed on any pallet.
+            if std::env::var("PDT_TRACE").is_ok() && state.step != Step::Idle {
+                let mut solids: Vec<(&str, Vec3, Vec3, f32)> = state
                     .held
                     .iter()
-                    .filter_map(|h| loads.get(h.entity).ok().map(|(_, l, t)| (t.translation, yaw_of(t.rotation), l.size)))
+                    .filter_map(|h| loads.get(h.entity).ok().map(|(_, l, t)| ("fardo da garra", t.translation, l.size / 2.0, yaw_of(t.rotation))))
                     .collect();
-                for (_, l, t) in loads.iter() {
-                    if l.state != LoadState::Placed(pallet) {
+                let grip_yaw = robot_yaw + state.pose.yaw;
+                let rot = Quat::from_rotation_y(grip_yaw);
+                let frame = robot_tf.transform_point(state.pose.local_point() + Vec3::Y * JAW_HEIGHT);
+                solids.push(("quadro do cabeçote", frame + Vec3::Y * 0.04, Vec3::new(0.25, 0.04, 0.617), grip_yaw));
+                let closed = state.unit.z / 2.0 + JAW_GAP;
+                let half = |jaw: f32| state.jaw_half(closed, jaw);
+                for (name, side) in [("pinça A", -half(state.jaw[0])), ("pinça B", half(state.jaw[1]))] {
+                    solids.push((name, frame + rot * Vec3::new(0.0, -JAW_HEIGHT / 2.0, side), Vec3::new(0.25, JAW_HEIGHT / 2.0, 0.006), grip_yaw));
+                }
+                // The robot's own cavalete and body (turned with J1).
+                let mut own: Vec<(&str, Vec3, Vec3, f32)> = Vec::new();
+                if let Some(b) = state.base {
+                    own.push(("o cavalete", robot_tf.transform_point(Vec3::new(0.0, -b.height / 2.0, 0.0)), Vec3::new(b.depth / 2.0, b.height / 2.0, b.width / 2.0), robot_yaw + b.yaw));
+                }
+                let j1 = state.pose.theta;
+                let along = (state.kin.body_front - state.kin.body_back) / 2.0;
+                own.push((
+                    "o corpo do robô",
+                    robot_tf.transform_point(Vec3::new(along * j1.cos(), state.kin.body_top / 2.0, -along * j1.sin())),
+                    Vec3::new((state.kin.body_front + state.kin.body_back) / 2.0, state.kin.body_top / 2.0, state.kin.body_half_width),
+                    robot_yaw + j1,
+                ));
+                for (name, c, h, y) in solids.iter().filter(|s| s.0 != "pinça A" && s.0 != "pinça B") {
+                    for (what, oc, oh, oy) in &own {
+                        if let Some(depth) = obb_depth(*c, *h, *y, *oc, *oh, *oy)
+                            && depth > 0.005
+                        {
+                            eprintln!("[{:.2}] {}: COLISÃO do {name} com {what} ({:.0} mm, {:?})", time.elapsed_secs(), robot_eq.name, depth * 1000.0, state.step);
+                        }
+                    }
+                }
+                let held: Vec<Entity> = state.held.iter().map(|h| h.entity).collect();
+                for (entity, l, t) in loads.iter() {
+                    let (pos, yaw) = match l.state {
+                        LoadState::Placed(pallet) => match loads.get(pallet) {
+                            Ok((_, _, ptf)) => (ptf.transform_point(t.translation), yaw_of(ptf.rotation) + yaw_of(t.rotation)),
+                            Err(_) => continue,
+                        },
+                        LoadState::Free if l.kind == LoadKind::Pallet => (t.translation, yaw_of(t.rotation)),
+                        _ => continue,
+                    };
+                    if held.contains(&entity) {
                         continue;
                     }
-                    let pos = ptf.transform_point(t.translation);
-                    let yaw = yaw_of(ptf.rotation) + yaw_of(t.rotation);
-                    for (hp, hy, hs) in &held {
-                        let vertical = (hs.y + l.size.y) / 2.0 - (hp.y - pos.y).abs();
-                        if vertical > 0.005 && overlap(*hp, *hy, pos, yaw, l.size) > 1e-3 {
-                            eprintln!("[{:.2}] {}: COLISÃO do fardo da garra com o pallet ({:.0} mm)", time.elapsed_secs(), robot_eq.name, vertical * 1000.0);
+                    for (name, c, h, y) in &solids {
+                        if let Some(depth) = obb_depth(*c, *h, *y, pos, l.size / 2.0, yaw)
+                            && depth > 0.005
+                        {
+                            let what = if l.kind == LoadKind::Pallet { "o pallet" } else { "um fardo do pallet" };
+                            eprintln!("[{:.2}] {}: COLISÃO do {name} com {what} ({:.0} mm, {:?})", time.elapsed_secs(), robot_eq.name, depth * 1000.0, state.step);
+                            if std::env::var("PDT_DBG").is_ok() {
+                                eprintln!("DBG solid {c:.3} half {h:.3} yaw {:.1} | fardo {pos:.3} half {:.3} yaw {:.1} | unit {:.3} jaw {:?} held {}", y.to_degrees(), l.size / 2.0, yaw.to_degrees(), state.unit, state.jaw, state.held.len());
+                            }
                         }
                     }
                 }
@@ -1713,31 +2101,34 @@ fn half_extent_along(rot: Quat, size: Vec3, dir: Vec3) -> f32 {
     x.dot(dir).abs() * size.x / 2.0 + z.dot(dir).abs() * size.z / 2.0
 }
 
-#[allow(clippy::type_complexity)]
+/// A robot on the cavalete stands on its top: the robot base height is the cavalete
+/// height (the robot program uses it as the mounting height above the floor).
+pub fn mount_on_base(mut robots: Query<(&Equipment, &mut Transform), With<RobotState>>) {
+    for (eq, mut tf) in &mut robots {
+        if eq.params.robot_base && (tf.translation.y - eq.params.base_height).abs() > 1e-4 {
+            tf.translation.y = eq.params.base_height;
+        }
+    }
+}
+
 pub fn animate_robots(
-    robots: Query<(&RobotState, &Transform), (Without<RobotPart>, Without<CadPart>)>,
+    robots: Query<&RobotState>,
     mut parts: Query<(&RobotPart, &ChildOf, &mut Transform), Without<CadPart>>,
     mut cad: Query<(&CadPart, &ChildOf, &mut Transform), Without<RobotPart>>,
 ) {
     for (part, child_of, mut tf) in &mut cad {
-        let Ok((state, _)) = robots.get(child_of.parent()) else { continue };
+        let Ok(state) = robots.get(child_of.parent()) else { continue };
         let joints = state.kin.solve(&state.pose);
         *tf = part.transform(&joints, state.pose.yaw - joints.j1);
     }
     for (part, child_of, mut tf) in &mut parts {
-        let Ok((state, robot_tf)) = robots.get(child_of.parent()) else { continue };
-        let (kin, pose) = (state.kin, state.pose);
+        let Ok(state) = robots.get(child_of.parent()) else { continue };
+        let (kin, pose) = (&state.kin, state.pose);
         let joints = kin.solve(&pose);
         let j1 = joints.j1;
         let u = joints.upper_dir;
         let upper_angle = u.y.atan2(u.x);
         *tf = match part {
-            RobotPart::Pedestal => {
-                // Unit cube stretched from the floor up to the base (hidden on the floor).
-                let h = robot_tf.translation.y.max(0.0);
-                let side = if h > 0.01 { 0.80 } else { 0.0 };
-                Transform::from_xyz(0.0, -h / 2.0, 0.0).with_scale(Vec3::new(side, h.max(0.001), side))
-            }
             RobotPart::Turntable => Transform::from_rotation(Quat::from_rotation_y(j1)),
             RobotPart::LowerArm => Transform {
                 translation: kin.plane_to_local(j1, joints.elbow / 2.0),
@@ -1766,8 +2157,8 @@ pub fn animate_robots(
                     ..default()
                 };
                 // Clamps close onto the picked group (its width along the gripper Z).
-                let closed = state.unit.z / 2.0 + 0.008;
-                let half = |jaw: f32| JAW_OPEN + (closed.min(JAW_OPEN) - JAW_OPEN) * jaw;
+                let closed = state.unit.z / 2.0 + JAW_GAP;
+                let half = |jaw: f32| state.jaw_half(closed, jaw);
                 match part {
                     RobotPart::JawA => gripper * Transform::from_xyz(0.0, -JAW_HEIGHT / 2.0, -half(state.jaw[0])),
                     RobotPart::JawB => gripper * Transform::from_xyz(0.0, -JAW_HEIGHT / 2.0, half(state.jaw[1])),
@@ -1885,6 +2276,47 @@ mod tests {
         let below_base = Vec3::new(2.0, -0.15, 0.0);
         assert!(KUKA.reach_report(below_base, -0.8).is_none());
         assert!(KUKA.reach_report(below_base, 0.0).is_some_and(|r| r.contains("abaixo do piso")));
+    }
+
+    #[test]
+    fn software_limits() {
+        // A1 limited to ±120°: a point behind the robot is out of reach.
+        let kin = KUKA.with_limits(&[[-120.0, 120.0]]);
+        let behind = Vec3::new(-2.0, 0.5, 0.5);
+        assert!(KUKA.solve(&Pose::from_local(behind, 0.0)).reachable);
+        assert!(!kin.solve(&Pose::from_local(behind, 0.0)).reachable);
+        assert!(kin.reach_report(behind, -1.0).is_some_and(|r| r.contains("A1 precisaria")));
+        // Never wider than the data sheet.
+        let wide = KUKA.with_limits(&[[-300.0, 300.0]]);
+        assert!((wide.max[0] - KUKA.max[0]).abs() < 1e-6);
+        // KUKA A1 ±185°: at 178° the arm may come from -182° (short way from -170°).
+        let j1 = KUKA.j1_near(178f32.to_radians(), -170f32.to_radians());
+        assert!((j1.to_degrees() + 182.0).abs() < 0.01, "{}", j1.to_degrees());
+        // FANUC J1 ±180°: no overlap, the long way.
+        let j1 = FANUC.j1_near(178f32.to_radians(), -170f32.to_radians());
+        assert!((j1.to_degrees() - 178.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn cabecote_against_cavalete_and_body() {
+        let base = Some(RobotBase { height: 1.15, width: 1.3, depth: 1.85, yaw: 0.0 });
+        // Long side of the cabeçote toward the robot (yaw 90°).
+        let radial_yaw = FRAC_PI_2;
+        // Below the base and right next to it: hits the cavalete.
+        assert_eq!(self_hit(&KUKA, base, Vec3::new(1.21, -0.5, 0.0), radial_yaw, 0.0), Some("o cavalete"));
+        // The narrow side toward the robot clears it at the same point.
+        assert_eq!(self_hit(&KUKA, base, Vec3::new(1.21, -0.5, 0.0), 0.0, 0.0), None);
+        // Far enough out, or above the base: clear.
+        assert_eq!(self_hit(&KUKA, base, Vec3::new(1.8, -0.5, 0.0), radial_yaw, 0.0), None);
+        assert_eq!(self_hit(&KUKA, base, Vec3::new(1.21, 1.0, 0.0), radial_yaw, 0.0), None);
+        // Close to the column, below the A2 hub: hits the body.
+        assert_eq!(self_hit(&KUKA, None, Vec3::new(1.0, 0.5, 0.0), radial_yaw, 0.0), Some("o corpo do robô (coluna)"));
+        // The path near the robot passes above the cavalete and the body.
+        let own = self_stacks(&KUKA, base);
+        // From 1.0 m out the column is in the way (the cavalete is lower).
+        let top = highest_on_path(&own, (0.0, 1.0), (1.0, 2.0)).map(|s| s.top);
+        assert_eq!(top, Some(KUKA.body_top));
+        assert!(highest_on_path(&own, (0.0, 2.6), (1.0, 2.6)).is_none());
     }
 
     #[test]

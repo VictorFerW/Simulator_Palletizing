@@ -37,7 +37,7 @@ pub struct Palette {
 pub type RobotCadPart = (robot::CadPart, Handle<Mesh>, Handle<StandardMaterial>);
 
 /// Same lookup as Bevy's file asset reader: BEVY_ASSET_ROOT, CARGO_MANIFEST_DIR or the exe folder.
-fn asset_root() -> std::path::PathBuf {
+pub fn asset_root() -> std::path::PathBuf {
     std::env::var_os("BEVY_ASSET_ROOT")
         .or_else(|| std::env::var_os("CARGO_MANIFEST_DIR"))
         .map(std::path::PathBuf::from)
@@ -218,7 +218,12 @@ pub fn build_visual(
                 }
             }
         }
-        EquipmentKind::Robot => robot_visual(parent, meshes, palette, p.robot_model),
+        EquipmentKind::Robot => {
+            if p.robot_base {
+                robot_base_visual(parent, meshes, palette, &p);
+            }
+            robot_visual(parent, meshes, palette, p.robot_model)
+        }
         EquipmentKind::CardboardPlacer => paper_visual(parent, meshes, palette, &p),
         EquipmentKind::PalletElevator => elevator_visual(parent, meshes, palette, &p),
         EquipmentKind::ShuttleCar => {
@@ -899,13 +904,6 @@ pub fn pallet_mesh(parent: &mut ChildSpawnerCommands, meshes: &mut Assets<Mesh>,
 }
 
 fn robot_visual(parent: &mut ChildSpawnerCommands, meshes: &mut Assets<Mesh>, palette: &Palette, model: RobotModel) {
-    // Pedestal under a robot mounted above the floor (sized by robot::animate_robots).
-    parent.spawn((
-        Mesh3d(meshes.add(Cuboid::new(1.0, 1.0, 1.0))),
-        MeshMaterial3d(palette.frame_grey.clone()),
-        Transform::from_scale(Vec3::ZERO),
-        RobotPart::Pedestal,
-    ));
     if let Some((_, parts)) = palette.robot_cad.iter().find(|(m, _)| *m == model) {
         for (part, mesh, material) in parts {
             parent.spawn((Mesh3d(mesh.clone()), MeshMaterial3d(material.clone()), Transform::default(), *part));
@@ -998,6 +996,56 @@ fn robot_visual(parent: &mut ChildSpawnerCommands, meshes: &mut Assets<Mesh>, pa
             ));
         });
     robot_gripper(parent, meshes, palette);
+}
+
+/// Cavalete base robô (Selgron 01F11M000520): welded tubular frame the robot stands
+/// on, 1150 mm wide and 1594.5 mm tall in the drawing (both editable), with four
+/// columns on anchored base plates, two top beams along the depth carrying the robot
+/// plate, a ring of beams at mid height and diagonal braces on the long sides. Built
+/// below the robot origin (the top of the plate), turned by `base_yaw`.
+fn robot_base_visual(parent: &mut ChildSpawnerCommands, meshes: &mut Assets<Mesh>, palette: &Palette, p: &crate::model::Params) {
+    const TUBE: f32 = 0.15;
+    const PLATE: f32 = 0.025;
+    let (h, w, d) = (p.base_height.max(0.2), p.base_width.max(0.4), p.base_depth.max(0.4));
+    let turn = Quat::from_rotation_y(p.base_yaw.to_radians());
+    let mut part = |size: Vec3, at: Vec3, rot: Quat, material: &Handle<StandardMaterial>| {
+        parent.spawn((
+            Mesh3d(meshes.add(Cuboid::new(size.x, size.y, size.z))),
+            MeshMaterial3d(material.clone()),
+            Transform::from_translation(turn * at).with_rotation(turn * rot),
+        ));
+    };
+    let (cx, cz) = (d / 2.0 - TUBE / 2.0, w / 2.0 - TUBE / 2.0);
+    let floor = -h;
+    let beam_y = -PLATE - TUBE / 2.0;
+    let column_h = h - PLATE - TUBE - PLATE;
+    let ring_y = floor + 0.46 * h;
+    // Robot mounting plate on the top beams.
+    part(Vec3::new(0.95f32.min(d), PLATE, w - 0.05), Vec3::new(0.0, -PLATE / 2.0, 0.0), Quat::IDENTITY, &palette.steel);
+    for sz in [-1.0, 1.0] {
+        // Top beam along the depth.
+        part(Vec3::new(d, TUBE, TUBE), Vec3::new(0.0, beam_y, sz * cz), Quat::IDENTITY, &palette.frame_grey);
+        // Mid-height beam along the depth.
+        part(Vec3::new(d - 2.0 * TUBE, 0.10, 0.10), Vec3::new(0.0, ring_y, sz * cz), Quat::IDENTITY, &palette.frame_grey);
+        // Diagonal braces from the mid-height beam up to the top beam.
+        for sx in [-1.0f32, 1.0] {
+            let a = Vec2::new(sx * (cx - TUBE / 2.0), ring_y);
+            let b = Vec2::new(sx * 0.12, beam_y - TUBE / 2.0);
+            let len = (b - a).length();
+            let angle = (b.y - a.y).atan2(b.x - a.x);
+            let mid = (a + b) / 2.0;
+            part(Vec3::new(len, 0.07, 0.07), Vec3::new(mid.x, mid.y, sz * cz), Quat::from_rotation_z(angle), &palette.frame_grey);
+        }
+        for sx in [-1.0, 1.0] {
+            // Column on its base plate (anchored with chemical anchors and M20 rods).
+            part(Vec3::new(TUBE, column_h, TUBE), Vec3::new(sx * cx, floor + PLATE + column_h / 2.0, sz * cz), Quat::IDENTITY, &palette.frame_grey);
+            part(Vec3::new(0.36, PLATE, 0.36), Vec3::new(sx * cx, floor + PLATE / 2.0, sz * cz), Quat::IDENTITY, &palette.steel);
+        }
+    }
+    for sx in [-1.0, 1.0] {
+        // Mid-height beam across the width, at each end.
+        part(Vec3::new(0.10, 0.10, w - 2.0 * TUBE), Vec3::new(sx * cx, ring_y, 0.0), Quat::IDENTITY, &palette.frame_grey);
+    }
 }
 
 /// Cabeçote Selgron "4 fardos" (0323P01-010000): 1234 x 500 mm frame with the

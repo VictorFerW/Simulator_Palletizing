@@ -124,7 +124,16 @@ pub fn layout(eq: &Equipment) -> ConveyorLayout {
             sensors: if eq.kind == EquipmentKind::PalletConveyor {
                 vec![PhotoSensor { key: "presence", x: x_end - 0.1, z0: -w / 2.0, z1: w / 2.0 }]
             } else {
-                Vec::new()
+                // Esteira de produtos: entry and exit sensors, each optional.
+                let beam = |key, x| PhotoSensor { key, x, z0: -w / 2.0, z1: w / 2.0 };
+                let mut sensors = Vec::new();
+                if p.belt_entry_sensor {
+                    sensors.push(beam("SensorEntrada", x_start + p.belt_entry_pos.clamp(0.02, l)));
+                }
+                if p.belt_exit_sensor {
+                    sensors.push(beam("SensorSaida", x_end - p.belt_exit_pos.clamp(0.02, l)));
+                }
+                sensors
             },
             ..Default::default()
         },

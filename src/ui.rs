@@ -44,6 +44,8 @@ pub struct UiState {
     tag_cache: TagCache,
     /// "Padrões de paletização" window.
     pattern: crate::pattern::PatternUi,
+    /// Left toolbar: catalog and scene list.
+    catalog: crate::ui_catalog::CatalogUi,
 }
 
 impl Default for UiState {
@@ -53,6 +55,7 @@ impl Default for UiState {
             helper_path: default_helper_path(),
             import_status: "Selecione um projeto .ap18 do TIA Portal V18.".into(),
             import_rx: None,
+            catalog: crate::ui_catalog::CatalogUi::default(),
             tag_filter: String::new(),
             tia_filter: String::new(),
             tag_cache: Default::default(),
@@ -103,7 +106,7 @@ pub fn ui_system(
     mut focus: ResMut<UiFocus>,
     mut settings: ResMut<EditorSettings>,
     mut requests: ResMut<EditRequests>,
-    (mut layout, mut start): (ResMut<LayoutRequests>, ResMut<crate::projects::StartScreen>),
+    (mut layout, mut start, thumbs): (ResMut<LayoutRequests>, ResMut<crate::projects::StartScreen>, Res<crate::ui_catalog::Thumbs>),
     mut link: ResMut<PlcLink>,
     mut equipment: EquipmentQuery,
     (robots, palletizers): (Query<&RobotState>, Query<&PalletizerState>),
@@ -112,7 +115,16 @@ pub fn ui_system(
     (mut placers, mut elevators): (PlacerQuery, ElevatorQuery),
     mut commands: Commands,
 ) {
+    // Catalog thumbnails as egui textures.
+    let tex: Vec<Option<egui::TextureId>> = thumbs
+        .0
+        .iter()
+        .map(|h| h.clone().map(|h| contexts.add_image(bevy_egui::EguiTextureHandle::Strong(h))))
+        .collect();
     let Ok(ctx) = contexts.ctx_mut() else { return };
+    if crate::thumbs::thumbs_enabled() {
+        return;
+    }
     // Start screen (projects): the editor is hidden while it is open.
     if crate::projects::start_screen(ctx, &mut start, &mut layout) {
         return;
@@ -193,72 +205,6 @@ pub fn ui_system(
                 ui.separator();
                 ui.weak(&layout.message);
             }
-        });
-    });
-
-    egui::SidePanel::left("catalog").default_width(230.0).show(ctx, |ui| {
-        ui.heading("Catálogo");
-        for kind in EquipmentKind::ALL {
-            if kind == EquipmentKind::Robot {
-                // One entry per robot model.
-                for model in crate::model::RobotModel::ALL {
-                    if ui.button(format!("+ Robô {}", model.label())).clicked() {
-                        requests.add_robot.push(model);
-                    }
-                }
-            } else if ui.button(format!("+ {}", kind.label())).clicked() {
-                requests.add.push(kind);
-            }
-        }
-        ui.separator();
-        ui.heading("Cena");
-        let mut items: Vec<(Entity, String, &str)> = equipment
-            .iter()
-            .map(|(e, eq, ..)| {
-                let prefix = if eq.kind == EquipmentKind::Robot { eq.params.robot_model.prefix() } else { eq.kind.prefix() };
-                (e, eq.name.clone(), prefix)
-            })
-            .collect();
-        items.sort_by(|a, b| a.1.cmp(&b.1));
-        egui::ScrollArea::vertical().id_salt("scene_list").max_height(320.0).show(ui, |ui| {
-            for (entity, name, prefix) in items {
-                ui.horizontal(|ui| {
-                    let marked = selection.1.contains(&entity);
-                    if ui
-                        .selectable_label(marked, format!("{name}  ·  {prefix}"))
-                        .on_hover_text("Ctrl+clique: adicionar/remover da seleção")
-                        .clicked()
-                    {
-                        if ui.input(|i| i.modifiers.command) {
-                            if marked {
-                                selection.1.retain(|e| *e != entity);
-                                selection.0 = selection.1.first().copied();
-                            } else {
-                                selection.1.push(entity);
-                                selection.0 = Some(entity);
-                            }
-                        } else {
-                            selection.1 = vec![entity];
-                            selection.0 = Some(entity);
-                        }
-                    }
-                    if ui.small_button("🗑").on_hover_text("Excluir").clicked() {
-                        requests.delete.push(entity);
-                    }
-                });
-            }
-        });
-        ui.separator();
-        ui.collapsing("Controles", |ui| {
-            ui.label(
-                "Clique: selecionar · Ctrl+clique: somar à seleção\n\
-                 Arrastar no vazio: seleção por retângulo\n\
-                 Arrastar item: mover a seleção (Alt inverte a grade)\n\
-                 R / Shift+R: girar ±90° · Q/E: girar ±15°\n\
-                 Setas: mover 0,1 m (Shift 0,5 m) · PgUp/PgDn: altura\n\
-                 Del: excluir · Ctrl+D: duplicar · F: focar · Esc: desmarcar\n\
-                 Botão direito: orbitar · Meio ou Shift+direito: deslocar · Roda: zoom",
-            );
         });
     });
 
@@ -348,6 +294,19 @@ pub fn ui_system(
         project.set_changed();
     }
 
+    // Toolbar and catalog / scene list over the 3D view (after the other panels).
+    let mut rows: Vec<crate::ui_catalog::SceneRow> = equipment
+        .iter()
+        .map(|(entity, eq, ..)| crate::ui_catalog::SceneRow {
+            entity,
+            name: eq.name.clone(),
+            kind: eq.kind,
+            item: crate::ui_catalog::item_of(eq.kind, eq.params.robot_model),
+        })
+        .collect();
+    rows.sort_by(|a, b| a.name.cmp(&b.name));
+    crate::ui_catalog::left_side(ctx, &mut state.catalog, &tex, &rows, &mut selection, &mut requests);
+
     focus.pointer_over_ui = ctx.is_pointer_over_area() || ctx.is_using_pointer();
     focus.keyboard_ui = ctx.wants_keyboard_input();
 }
@@ -415,6 +374,12 @@ fn properties_tab(
         .iter()
         .filter(|(_, e, ..)| e.kind == EquipmentKind::PalletizingConveyor)
         .map(|(_, e, ..)| e.name.clone())
+        .collect();
+    // Emitters (name, position, box length) for the belt sensor check.
+    let emitters: Vec<(String, Vec3, f32)> = equipment
+        .iter()
+        .filter(|(_, e, ..)| e.kind == EquipmentKind::BoxEmitter)
+        .map(|(_, e, tf, ..)| (e.name.clone(), tf.translation, e.params.box_size[0].max(e.params.box_size[2])))
         .collect();
     // Mesas/belts and palletizing TDPs within reach of the selected robot (for the routes).
     let robot_tf = selection
@@ -509,6 +474,24 @@ fn properties_tab(
     });
     ui.separator();
 
+    // Esteira with its FB: an emitter dropping boxes past the entry sensor never
+    // starts the belt (the boxes did not go through the sensor).
+    let belt_warning = (eq.kind == EquipmentKind::BeltConveyor && eq.params.belt_logic && eq.params.belt_entry_sensor)
+        .then(|| {
+            let inverse = tf.compute_affine().inverse();
+            let p = &eq.params;
+            let sensor = -p.length / 2.0 + p.belt_entry_pos;
+            emitters.iter().find_map(|(name, at, len)| {
+                let local = inverse.transform_point3(*at);
+                (local.z.abs() < p.width / 2.0 && local.x.abs() < p.length / 2.0 && local.x - len / 2.0 > sensor).then(|| {
+                    format!(
+                        "O {name} solta as caixas depois do sensor de entrada, e elas não ligam a esteira. Coloque o sensor a {:.2} m do início ou o emissor no começo da esteira.",
+                        (local.x + p.length / 2.0).max(0.1)
+                    )
+                })
+            })
+        })
+        .flatten();
     let before = eq.params.clone();
     let kind = eq.kind;
     let tdp_name = eq.name.clone();
@@ -525,6 +508,40 @@ fn properties_tab(
                 row(ui, "Largura (rolete)", &mut p.width, 0.2..=2.0, " m");
                 row(ui, "Altura do topo", &mut p.height, 0.1..=3.0, " m");
                 row(ui, "Velocidade", &mut p.speed, 0.0..=3.0, " m/s");
+                if kind == EquipmentKind::BeltConveyor {
+                    ui.label("Sensor de entrada");
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut p.belt_entry_sensor, "");
+                        if p.belt_entry_sensor {
+                            ui.add(egui::DragValue::new(&mut p.belt_entry_pos).speed(0.01).range(0.02..=p.length).suffix(" m do início"));
+                        }
+                    });
+                    ui.end_row();
+                    ui.label("Sensor de saída");
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut p.belt_exit_sensor, "");
+                        if p.belt_exit_sensor {
+                            ui.add(egui::DragValue::new(&mut p.belt_exit_pos).speed(0.01).range(0.02..=p.length).suffix(" m do fim"));
+                        }
+                    });
+                    ui.end_row();
+                    if let Some(warning) = &belt_warning {
+                        ui.label("");
+                        ui.colored_label(egui::Color32::from_rgb(230, 150, 40), warning);
+                        ui.end_row();
+                    }
+                    ui.label("Lógica interna");
+                    ui.checkbox(&mut p.belt_logic, "FB da esteira sem CLP")
+                        .on_hover_text("Liga o motor com produto nos sensores; desliga por ociosidade. Sem a lógica, o motor fica sempre ligado (ou pelo CLP).");
+                    ui.end_row();
+                    if p.belt_logic {
+                        ui.label("Acumulação");
+                        ui.checkbox(&mut p.belt_accumulate, "AtivaAcumulo: para com produto na saída se a próxima não pode receber");
+                        ui.end_row();
+                        row(ui, "TempoOciosidade", &mut p.belt_idle_time, 1.0..=600.0, " s");
+                        row(ui, "TempoVaiPara", &mut p.belt_run_on, 0.5..=120.0, " s");
+                    }
+                }
             }
             EquipmentKind::Table2Stage | EquipmentKind::Table3Stage => {
                 row(ui, "Comprimento total", &mut p.length, 0.6..=10.0, " m");
@@ -553,6 +570,23 @@ fn properties_tab(
                     }
                 });
                 ui.end_row();
+                ui.label("Cavalete (base)");
+                ui.checkbox(&mut p.robot_base, "Robô sobre o cavalete Selgron 01F11M000520")
+                    .on_hover_text("O topo do cavalete é a altura da base do robô");
+                ui.end_row();
+                if p.robot_base {
+                    row(ui, "Cavalete: altura", &mut p.base_height, 0.2..=4.0, " m");
+                    row(ui, "Cavalete: largura", &mut p.base_width, 0.5..=4.0, " m");
+                    row(ui, "Cavalete: comprimento", &mut p.base_depth, 0.5..=6.0, " m");
+                    ui.label("Cavalete: giro");
+                    ui.horizontal(|ui| {
+                        ui.add(egui::DragValue::new(&mut p.base_yaw).speed(1.0).range(-180.0..=180.0).suffix("°"));
+                        if ui.small_button("+90°").clicked() {
+                            p.base_yaw = if p.base_yaw >= 90.0 { p.base_yaw - 270.0 } else { p.base_yaw + 90.0 };
+                        }
+                    });
+                    ui.end_row();
+                }
                 ui.label("Coletar de");
                 names_select(ui, "pick_from", &mut p.pick_from, &conveyor_names, "(todas ao alcance)");
                 ui.end_row();
@@ -580,6 +614,44 @@ fn properties_tab(
                     }
                     if !reach_tdps.is_empty() {
                         ui.weak(format!("{} mesa(s)/esteira(s) e {} TDP(s) no alcance", reach_picks.len(), reach_tdps.len()));
+                    }
+                });
+                ui.end_row();
+                ui.label("Limites de giro");
+                ui.vertical(|ui| {
+                    // Software limits inside the data sheet (manufacturer's axes).
+                    let sheet = crate::robot::kin(p.robot_model);
+                    if p.axis_limits.len() < 4 {
+                        let current = p.axis_limits.clone();
+                        p.axis_limits = (0..4)
+                            .map(|i| current.get(i).copied().unwrap_or([sheet.min[i].to_degrees(), sheet.max[i].to_degrees()]))
+                            .collect();
+                    }
+                    egui::Grid::new("axis_limits").num_columns(4).show(ui, |ui| {
+                        for h in ["Eixo", "Mín.", "Máx.", "Folha de dados"] {
+                            ui.weak(h);
+                        }
+                        ui.end_row();
+                        for i in 0..4 {
+                            let (lo, hi) = (sheet.min[i].to_degrees(), sheet.max[i].to_degrees());
+                            let [min, max] = &mut p.axis_limits[i];
+                            ui.label(sheet.axis_names[i]);
+                            ui.add(egui::DragValue::new(min).speed(1.0).range(lo..=*max - 1.0).suffix("°"));
+                            ui.add(egui::DragValue::new(max).speed(1.0).range(*min + 1.0..=hi).suffix("°"));
+                            ui.weak(format!("{lo:.0}° … {hi:.0}°"));
+                            ui.end_row();
+                        }
+                    });
+                    let full = (0..4).all(|i| {
+                        (p.axis_limits[i][0] - sheet.min[i].to_degrees()).abs() < 0.01
+                            && (p.axis_limits[i][1] - sheet.max[i].to_degrees()).abs() < 0.01
+                    });
+                    if full {
+                        ui.weak("Faixas da folha de dados");
+                        // Nothing to store: the file keeps following the data sheet.
+                        p.axis_limits.clear();
+                    } else if ui.button("Voltar à folha de dados").clicked() {
+                        p.axis_limits.clear();
                     }
                 });
                 ui.end_row();
@@ -825,11 +897,24 @@ fn properties_tab(
         || before.height != eq.params.height
         || (kind.is_mesa() && (before.box_size != eq.params.box_size || before.fardo_10kg != eq.params.fardo_10kg))
         || (kind == EquipmentKind::CardboardPlacer && before.pallet_size != eq.params.pallet_size)
+        || before.belt_entry_sensor != eq.params.belt_entry_sensor
+        || before.belt_entry_pos != eq.params.belt_entry_pos
+        || before.belt_exit_pos != eq.params.belt_exit_pos
+        || before.belt_exit_sensor != eq.params.belt_exit_sensor
         || before.robot_model != eq.params.robot_model
+        || before.robot_base != eq.params.robot_base
+        || before.base_height != eq.params.base_height
+        || before.base_width != eq.params.base_width
+        || before.base_depth != eq.params.base_depth
+        || before.base_yaw != eq.params.base_yaw
         || before.car_length != eq.params.car_length
         || before.car_width != eq.params.car_width
         || (kind == EquipmentKind::PalletElevator
             && (before.pallet_size != eq.params.pallet_size || before.stack_size != eq.params.stack_size));
+    if before.robot_model != eq.params.robot_model {
+        // The limits of the other model do not apply.
+        eq.params.axis_limits.clear();
+    }
     if geometry_changed {
         commands.entity(entity).insert(NeedsRebuild);
     }
@@ -864,7 +949,7 @@ fn properties_tab(
                     robot.pose.y
                 ));
                 // Axes against the data sheet limits and speeds.
-                let kin = robot.kin;
+                let kin = &robot.kin;
                 let axes = kin.to_motor(kin.axes(&robot.pose));
                 egui::Grid::new("robot_axes").striped(true).show(ui, |ui| {
                     for h in ["Eixo", "Posição", "Faixa", "Velocidade", "Máx."] {

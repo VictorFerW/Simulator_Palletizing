@@ -109,6 +109,7 @@ pub fn process_layout_requests(
     mut project: ResMut<ProjectState>,
     mut link: ResMut<PlcLink>,
     mut selection: ResMut<Selection>,
+    mut history: ResMut<crate::editor::UndoHistory>,
     equipment: Query<(Entity, &Equipment, &Transform, &TagBindings, &Io)>,
     loads: Query<(Entity, &Load)>,
 ) {
@@ -187,6 +188,8 @@ pub fn process_layout_requests(
         }
     }
     selection.0 = None;
+    // A new scene starts a new undo history.
+    history.reset = true;
     if let Some(mut file) = parsed {
         project.0 = file.project;
         if let Some(old) = file.plc.take().filter(|p| !p.host.is_empty()) {
@@ -323,6 +326,7 @@ pub fn spawn_default_cell(commands: &mut Commands, meshes: &mut Assets<Mesh>, pa
 pub fn setup_default_cell(mut requests: ResMut<LayoutRequests>, mut start: ResMut<crate::projects::StartScreen>) {
     match std::env::var("PDT_LAYOUT") {
         Ok(path) => requests.load = Some(path.into()),
+        Err(_) if crate::thumbs::thumbs_enabled() => {}
         Err(_) if std::env::var("PDT_SCREENSHOT").is_ok() && std::env::var("PDT_START").is_err() => {
             requests.new_default = true
         }

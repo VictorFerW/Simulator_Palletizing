@@ -35,6 +35,7 @@ pub enum EquipmentKind {
 }
 
 impl EquipmentKind {
+    #[cfg(test)]
     pub const ALL: [Self; 14] = [
         Self::BeltConveyor,
         Self::Table2Stage,
@@ -138,9 +139,14 @@ impl EquipmentKind {
 use SignalDir::{In, Out};
 use SignalType::{Bool, Int};
 
+// Esteira de produtos (FB da esteira): sensores de entrada e saída opcionais.
 const BELT_SIGNALS: &[SignalDef] = &[
     SignalDef::new("motor", "Motor ligado", In, Bool),
     SignalDef::new("reverse", "Sentido reverso", In, Bool),
+    SignalDef::new("EsteiraPosteriorOK", "Esteira posterior OK", In, Bool),
+    SignalDef::new("SensorEntrada", "Sensor de entrada", Out, Bool),
+    SignalDef::new("SensorSaida", "Sensor de saída", Out, Bool),
+    SignalDef::new("EsteiraCheia", "Esteira cheia", Out, Bool),
 ];
 // Mesa Antecipada Roletada (FB "Mesa_2estagios") + Mesa Área de Coleta.
 const TABLE2_SIGNALS: &[SignalDef] = &[
@@ -351,6 +357,30 @@ pub struct Params {
     pub speed_override: f32,
     /// Robot: manufacturer model (kinematics, limits, speeds and 3D model).
     pub robot_model: RobotModel,
+    /// Robot: mounted on the cavalete (Selgron 01F11M000520), whose top is the robot
+    /// base height; size and turn relative to the robot.
+    pub robot_base: bool,
+    pub base_height: f32,
+    pub base_width: f32,
+    pub base_depth: f32,
+    pub base_yaw: f32,
+    /// Robot: software limits of the axes (degrees, [min, max] per axis in the
+    /// manufacturer's axes: J1..J4 / A1, A2, A3, A6), inside the data sheet; empty =
+    /// the data sheet ranges.
+    pub axis_limits: Vec<[f32; 2]>,
+    /// Esteira de produtos: sensors at the entry and at the exit (each optional),
+    /// accumulation (AtivaAcumulo), TempoOciosidade and TempoVaiPara (s).
+    /// Esteira de produtos: run by its FB (otherwise the motor stays on unless the
+    /// PLC drives it). Off in layouts saved before it existed.
+    pub belt_logic: bool,
+    pub belt_entry_sensor: bool,
+    pub belt_exit_sensor: bool,
+    /// Entry sensor from the belt start and exit sensor from its end (m).
+    pub belt_entry_pos: f32,
+    pub belt_exit_pos: f32,
+    pub belt_accumulate: bool,
+    pub belt_idle_time: f32,
+    pub belt_run_on: f32,
     /// Robot: which mesas feed each palletizing TDP (none listed = every one).
     pub routes: Vec<Route>,
     /// CVZ: TDP on the car, length along its transport (across the rail).
@@ -461,6 +491,20 @@ impl Default for Params {
             place_on: Vec::new(),
             speed_override: 1.0,
             robot_model: RobotModel::default(),
+            robot_base: false,
+            base_height: 1.5945,
+            base_width: 1.15,
+            base_depth: 1.60,
+            base_yaw: 0.0,
+            axis_limits: Vec::new(),
+            belt_logic: false,
+            belt_entry_sensor: true,
+            belt_exit_sensor: true,
+            belt_entry_pos: 0.1,
+            belt_exit_pos: 0.1,
+            belt_accumulate: true,
+            belt_idle_time: 30.0,
+            belt_run_on: 5.0,
             routes: Vec::new(),
             car_length: 1.56,
             car_width: 1.28,
@@ -491,7 +535,7 @@ impl Params {
     pub fn for_kind(kind: EquipmentKind) -> Self {
         let base = Self::default();
         match kind {
-            EquipmentKind::BeltConveyor => Self { length: 4.0, ..base },
+            EquipmentKind::BeltConveyor => Self { length: 4.0, belt_logic: true, ..base },
             // Selgron: roletes L=1200, cada estágio ~1,2 m; roletes mais rápidos que a esteira
             // de entrada para abrir espaço entre os fardos.
             EquipmentKind::Table2Stage => Self { length: 2.4, width: 1.2, speed: 0.8, ..base },
@@ -581,6 +625,11 @@ impl Equipment {
                 Vec3::new(-p.length / 2.0, 0.0, -p.width / 2.0 - 0.08),
                 Vec3::new(p.length / 2.0, p.height + 0.1, p.width / 2.0 + 0.08),
             ),
+            EquipmentKind::Robot if p.robot_base => {
+                // The cavalete under the robot (turned by base_yaw: take the larger side).
+                let half = (p.base_width.max(p.base_depth) / 2.0).max(0.76);
+                (Vec3::new(-half, -p.base_height, -half), Vec3::new(half, 2.8, half))
+            }
             EquipmentKind::Robot => (Vec3::new(-0.76, 0.0, -0.76), Vec3::new(0.76, 2.8, 0.76)),
             EquipmentKind::Sensor => (
                 Vec3::new(-0.08, 0.0, -0.08),

@@ -58,6 +58,9 @@ pub struct EditRequests {
     pub add: Vec<EquipmentKind>,
     /// New robots of these models.
     pub add_robot: Vec<crate::model::RobotModel>,
+    /// Catalog items to add: at the center of the view, or where they were dropped
+    /// (screen position over the 3D view).
+    pub place: Vec<(usize, Option<Vec2>)>,
     pub delete: Vec<Entity>,
     pub duplicate: Vec<Entity>,
     pub focus: Option<Entity>,
@@ -96,11 +99,14 @@ pub fn spawn_equipment(
             let logic = MesaLogic::for_kind(k).expect("mesa kind");
             root.insert((ConveyorState::default(), MesaMech::default(), logic));
         }
+        EquipmentKind::BeltConveyor => {
+            root.insert((ConveyorState::default(), crate::belt::BeltLogic::default()));
+        }
         k if k.is_conveyor() => {
             root.insert(ConveyorState::default());
         }
         EquipmentKind::Robot => {
-            root.insert(RobotState::new(crate::robot::kin(equipment.params.robot_model)));
+            root.insert(RobotState::new(crate::robot::kin(equipment.params.robot_model).with_limits(&equipment.params.axis_limits)));
         }
         EquipmentKind::BoxEmitter | EquipmentKind::PalletDispenser => {
             root.insert(EmitterState::default());
@@ -125,7 +131,7 @@ pub fn rebuild_visuals(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub fn process_edit_requests(
     mut requests: ResMut<EditRequests>,
     mut selection: ResMut<Selection>,
@@ -135,10 +141,35 @@ pub fn process_edit_requests(
     equipment: Query<(Entity, &Equipment, &Transform, &TagBindings)>,
     robots: Query<&RobotState>,
     mut cameras: Query<&mut OrbitCamera>,
+    (views, settings): (Query<(&Camera, &GlobalTransform), With<OrbitCamera>>, Res<EditorSettings>),
 ) {
     let names: Vec<String> = equipment.iter().map(|(_, e, ..)| e.name.clone()).collect();
     let mut taken = names.clone();
     let target = cameras.single().map(|c| c.target).unwrap_or(Vec3::ZERO);
+    // Catalog: at the center of the view, or on the floor where the card was dropped.
+    for (index, screen) in std::mem::take(&mut requests.place) {
+        let Some(item) = crate::catalog::ITEMS.get(index) else { continue };
+        let floor = screen
+            .and_then(|pos| {
+                let (camera, at) = views.single().ok()?;
+                ground_point(&camera.viewport_to_world(at, pos).ok()?, 0.0)
+            })
+            .unwrap_or(target);
+        let step = if settings.snap { settings.grid.max(0.01) } else { 0.01 };
+        let at = Vec3::new((floor.x / step).round() * step, 0.0, (floor.z / step).round() * step);
+        let name = unique_name(item.prefix(), taken.iter().map(String::as_str));
+        taken.push(name.clone());
+        let entity = spawn_equipment(
+            &mut commands,
+            &mut meshes,
+            &palette,
+            Equipment { name, kind: item.kind, params: item.params() },
+            Transform::from_translation(at),
+            TagBindings::default(),
+        );
+        selection.0 = Some(entity);
+        selection.1 = vec![entity];
+    }
     let robots_to_add: Vec<(EquipmentKind, Option<crate::model::RobotModel>)> =
         std::mem::take(&mut requests.add_robot).into_iter().map(|m| (EquipmentKind::Robot, Some(m))).collect();
     for (kind, model) in std::mem::take(&mut requests.add).into_iter().map(|k| (k, None)).chain(robots_to_add) {
@@ -673,8 +704,35 @@ pub fn draw_gizmos(
                 // Data sheet envelope of the model: reach, inner radius at the floor and
                 // rear interference, plus the operating space of the flange center in the
                 // current arm plane.
-                let kin = crate::robot::kin(eq.params.robot_model);
+                let kin = crate::robot::kin(eq.params.robot_model).with_limits(&eq.params.axis_limits);
                 let floor = Isometry3d::new(tf.translation + Vec3::Y * 0.01, Quat::from_rotation_x(FRAC_PI_2));
+                // J1 range around the base: green arc of the allowed directions (a
+                // spiral, so the part past ±180° shows twice), red rays at the limits,
+                // red arc over the forbidden sector and the white current direction.
+                let dir = |a: f32, r: f32| tf.transform_point(Vec3::new(r * a.cos(), 0.02, -r * a.sin()));
+                let (lo, hi) = (kin.min[0], kin.max[0]);
+                let steps = 96;
+                let arc = (0..=steps).map(|k| {
+                    let t = k as f32 / steps as f32;
+                    dir(lo + (hi - lo) * t, 1.05 + 0.25 * t)
+                });
+                gizmos.linestrip(arc, Color::srgb(0.2, 0.95, 0.35));
+                let red = Color::srgb(1.0, 0.15, 0.1);
+                for (a, r_end) in [(lo, 1.05), (hi, 1.30)] {
+                    gizmos.line(dir(a, 0.4), dir(a, kin.reach), red);
+                    gizmos.line(dir(a, r_end - 0.08), dir(a, r_end + 0.08), red);
+                }
+                if hi - lo < 2.0 * std::f32::consts::PI {
+                    let gap = 2.0 * std::f32::consts::PI - (hi - lo);
+                    let forbidden = (0..=32).map(|k| dir(hi + gap * k as f32 / 32.0, 1.6));
+                    gizmos.linestrip(forbidden, red);
+                }
+                // J1 = 0 and the current J1.
+                gizmos.line(dir(0.0, 0.4), dir(0.0, 1.6), Color::srgba(0.2, 0.95, 0.35, 0.6));
+                if let Ok(state) = robots.get(entity) {
+                    let j1 = state.kin.axes(&state.pose).0[0];
+                    gizmos.line(dir(j1, 0.4), dir(j1, 1.9), Color::WHITE);
+                }
                 gizmos.circle(floor, kin.reach, Color::srgba(1.0, 0.8, 0.0, 0.6));
                 gizmos.circle(floor, kin.min_radius, Color::srgba(1.0, 0.5, 0.0, 0.5));
                 gizmos.circle(floor, kin.rear_radius, Color::srgba(1.0, 0.2, 0.1, 0.6));
@@ -688,5 +746,162 @@ pub fn draw_gizmos(
             }
             _ => {}
         }
+    }
+}
+
+/// One equipment in an undo step: what the editor can change.
+#[derive(Clone)]
+struct Snap {
+    name: String,
+    kind: EquipmentKind,
+    params: Params,
+    transform: Transform,
+    bindings: TagBindings,
+}
+
+/// The scene and a text key to compare scenes.
+#[derive(Clone)]
+struct Scene {
+    items: Vec<Snap>,
+    key: String,
+}
+
+impl Scene {
+    fn new(mut items: Vec<Snap>) -> Self {
+        items.sort_by(|a, b| a.name.cmp(&b.name));
+        let key = serde_json::to_string(
+            &items
+                .iter()
+                .map(|s| (&s.name, s.kind, &s.params, s.transform.translation.to_array(), s.transform.rotation.to_array(), &s.bindings))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap_or_default();
+        Self { items, key }
+    }
+}
+
+const UNDO_MAX: usize = 100;
+
+/// Ctrl+Z / Ctrl+Y: edits of the scene (position, rotation, height, values in the
+/// property panel, added, duplicated and deleted equipment). A step is recorded when
+/// the edit ends (mouse released, text field left), so a drag is one step.
+#[derive(Resource, Default)]
+pub struct UndoHistory {
+    undo: Vec<Scene>,
+    redo: Vec<Scene>,
+    last: Option<Scene>,
+    /// A new scene was loaded: start a new history.
+    pub reset: bool,
+    /// Undo (true) or redo (false) requested outside the keyboard (tests).
+    pub request: Option<bool>,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn undo_redo(
+    mut history: ResMut<UndoHistory>,
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    palette: Res<Palette>,
+    keys: Res<ButtonInput<KeyCode>>,
+    mouse: Res<ButtonInput<MouseButton>>,
+    focus: Res<UiFocus>,
+    mut equipment: Query<(Entity, &mut Equipment, &mut Transform, &mut TagBindings)>,
+    mut removed: RemovedComponents<Equipment>,
+) {
+    if history.reset {
+        *history = UndoHistory::default();
+    }
+    let ctrl = keys.any_pressed([KeyCode::ControlLeft, KeyCode::ControlRight]);
+    let shift = keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]);
+    let request = history.request.take();
+    let undo = (ctrl && !shift && keys.just_pressed(KeyCode::KeyZ)) || request == Some(true);
+    let redo = (ctrl && (keys.just_pressed(KeyCode::KeyY) || (shift && keys.just_pressed(KeyCode::KeyZ)))) || request == Some(false);
+    if !focus.keyboard_ui && (undo || redo) {
+        let target = if undo { history.undo.pop() } else { history.redo.pop() };
+        let Some(target) = target else { return };
+        if let Some(current) = history.last.take() {
+            if undo {
+                history.redo.push(current);
+            } else {
+                history.undo.push(current);
+            }
+        }
+        // Apply: same names are updated in place, the others spawned or removed.
+        for snap in &target.items {
+            match equipment.iter_mut().find(|(_, eq, ..)| eq.name == snap.name && eq.kind == snap.kind) {
+                Some((entity, mut eq, mut tf, mut bindings)) => {
+                    *tf = snap.transform;
+                    let before = serde_json::to_string(&eq.params).unwrap_or_default();
+                    if before != serde_json::to_string(&snap.params).unwrap_or_default() {
+                        eq.params = snap.params.clone();
+                        commands.entity(entity).insert(NeedsRebuild);
+                    }
+                    bindings.0 = snap.bindings.0.clone();
+                }
+                None => {
+                    spawn_equipment(
+                        &mut commands,
+                        &mut meshes,
+                        &palette,
+                        Equipment { name: snap.name.clone(), kind: snap.kind, params: snap.params.clone() },
+                        snap.transform,
+                        snap.bindings.clone(),
+                    );
+                }
+            }
+        }
+        for (entity, eq, ..) in &equipment {
+            if !target.items.iter().any(|s| s.name == eq.name && s.kind == eq.kind) {
+                commands.entity(entity).despawn();
+            }
+        }
+        history.last = Some(target);
+        removed.clear();
+        return;
+    }
+    // Record when an edit ended.
+    let changed = equipment.iter_mut().any(|(_, eq, tf, bindings)| eq.is_changed() || tf.is_changed() || bindings.is_changed());
+    let touched = changed || removed.read().count() > 0 || history.last.is_none();
+    if !touched || mouse.get_pressed().next().is_some() || focus.keyboard_ui {
+        return;
+    }
+    let scene = Scene::new(
+        equipment
+            .iter()
+            .map(|(_, eq, tf, bindings)| Snap {
+                name: eq.name.clone(),
+                kind: eq.kind,
+                params: eq.params.clone(),
+                transform: *tf,
+                bindings: bindings.clone(),
+            })
+            .collect(),
+    );
+    match history.last.take() {
+        Some(last) if last.key != scene.key => {
+            if std::env::var("PDT_TRACE").is_ok() {
+                let differs: Vec<&str> = scene
+                    .items
+                    .iter()
+                    .filter(|s| {
+                        !last.items.iter().any(|o| {
+                            o.name == s.name
+                                && o.transform == s.transform
+                                && serde_json::to_string(&o.params).ok() == serde_json::to_string(&s.params).ok()
+                        })
+                    })
+                    .map(|s| s.name.as_str())
+                    .collect();
+                eprintln!("desfazer: passo {} gravado ({})", history.undo.len() + 1, differs.join(", "));
+            }
+            history.undo.push(last);
+            if history.undo.len() > UNDO_MAX {
+                history.undo.remove(0);
+            }
+            history.redo.clear();
+            history.last = Some(scene);
+        }
+        Some(last) => history.last = Some(last),
+        None => history.last = Some(scene),
     }
 }

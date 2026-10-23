@@ -865,6 +865,7 @@ pub fn reset_simulation(
     loads: Query<(Entity, &Load)>,
     mut robots: Query<&mut crate::robot::RobotState>,
     mut emitters: Query<&mut EmitterState>,
+    mut belts: Query<&mut crate::belt::BeltLogic>,
     mut mesas: Query<(&Equipment, &mut crate::mesa_logic::MesaLogic, &mut MesaMech)>,
     mut elevators: Query<(&Equipment, &mut crate::elevator::ElevatorState, &mut crate::elevator::ElevatorLogic)>,
     mut shuttles: Query<(
@@ -886,7 +887,10 @@ pub fn reset_simulation(
         }
     }
     for mut r in &mut robots {
-        *r = crate::robot::RobotState::new(r.kin);
+        *r = crate::robot::RobotState::new(r.kin.clone());
+    }
+    for mut b in &mut belts {
+        *b = crate::belt::BeltLogic::default();
     }
     for mut e in &mut emitters {
         e.timer = 0.0;
